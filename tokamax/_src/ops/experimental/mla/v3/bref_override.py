@@ -42,6 +42,27 @@ class _BypassRef(pltpu.BufferedRef):
     pass
 
 
+def _rebuild_with_cfgs(cls, standard_ref, cfgs):
+  """Re-wraps a plain `pltpu.BufferedRef` as `cls`, attaching `cfgs`.
+
+  Every subclass in this module adds exactly one field (`cfgs`) to
+  `pltpu.BufferedRef`, so construction is a field-by-field copy of the standard
+  ref plus that field. The copy is keyed by field *name*, so a Pallas release
+  that renames or drops a `BufferedRef` field raises `TypeError` here rather
+  than silently mis-wiring a buffer.
+
+  This reaches into Pallas internals: `pltpu.BufferedRef` is not a stable public
+  API. Verified against jax 0.11.x; revisit on JAX upgrades.
+  """
+  return cls(
+      cfgs=cfgs,
+      **{
+          f.name: getattr(standard_ref, f.name)
+          for f in dataclasses.fields(pltpu.BufferedRef)
+      },
+  )
+
+
 # ==============================================================================
 # Transposed KV Cache BufferedRef (SEQ_ALONG_LANE)
 # ==============================================================================
@@ -76,13 +97,7 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         use_lookahead=use_lookahead,
         **kwargs,
     )
-    return cls(
-        cfgs=cfgs,
-        **{
-            f.name: getattr(standard_ref, f.name)
-            for f in dataclasses.fields(pltpu.BufferedRef)
-        },
-    )
+    return _rebuild_with_cfgs(cls, standard_ref, cfgs)
 
   def copy_in(
       self,
@@ -279,13 +294,7 @@ class BatchingQNopeRef(pltpu.BufferedRef):
         use_lookahead=use_lookahead,
         **kwargs,
     )
-    return cls(
-        cfgs=cfgs,
-        **{
-            f.name: getattr(standard_ref, f.name)
-            for f in dataclasses.fields(pltpu.BufferedRef)
-        },
-    )
+    return _rebuild_with_cfgs(cls, standard_ref, cfgs)
 
   def copy_in(
       self,
@@ -372,13 +381,7 @@ class BatchingQPeRef(pltpu.BufferedRef):
         use_lookahead=use_lookahead,
         **kwargs,
     )
-    return cls(
-        cfgs=cfgs,
-        **{
-            f.name: getattr(standard_ref, f.name)
-            for f in dataclasses.fields(pltpu.BufferedRef)
-        },
-    )
+    return _rebuild_with_cfgs(cls, standard_ref, cfgs)
 
   def copy_in(
       self,
@@ -470,13 +473,7 @@ class BatchingORef(pltpu.BufferedRef):
         use_lookahead=use_lookahead,
         **kwargs,
     )
-    return cls(
-        cfgs=cfgs,
-        **{
-            f.name: getattr(standard_ref, f.name)
-            for f in dataclasses.fields(pltpu.BufferedRef)
-        },
-    )
+    return _rebuild_with_cfgs(cls, standard_ref, cfgs)
 
   def copy_out(
       self,

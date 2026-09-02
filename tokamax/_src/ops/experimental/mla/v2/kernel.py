@@ -2300,7 +2300,8 @@ def prepare_outputs(
     donate_argnames=("cache_kv", ),
 )
 def mla_ragged_paged_attention(
-    ql_nope: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_lkv_dim]
+    # Head-first, unlike `q_pe`; `prepare_q_nope_inputs` does the transpose.
+    ql_nope: jax.Array,  # [actual_num_q_heads, max_num_tokens, actual_lkv_dim]
     q_pe: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_r_dim]
     new_kv_c: jax.Array,  # [max_num_tokens, actual_lkv_dim]
     new_k_pe: jax.Array,  # [max_num_tokens, actual_r_dim]

@@ -19,7 +19,6 @@ for SEQ_ALONG_LANE memory layout.
 """
 
 from typing import Any
-from absl import logging
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
@@ -83,7 +82,12 @@ def _stitch_prefill_lane(
       words_per_sublane, num_sublanes, v_len
   )
 
-  # Do we need the mod here?
+  # The `% v_len` is required, not defensive: the difference is negative
+  # whenever the new tokens land at a higher lane index than the stitch
+  # boundary (`cache_pages` rounds `bkv_sz_cache` *up* to a page, so the source
+  # offset routinely exceeds the destination). `pltpu.roll` needs a
+  # non-negative shift, and rolling by `d` is congruent to rolling by
+  # `d % v_len` on a v_len-wide axis, so the mod maps it to the right one.
   roll_shift = (
       bkv_sz_cache - (cache_pages * cfgs.serve.page_size + new_tok_offset)
   ) % v_len
@@ -153,14 +157,12 @@ def stitch_new_kv_lane(
 
   Expects vmem_ref shape: [batch, sublanes, packing, bkv_sz + 2 * page_size]
   """
-  logging.info("AJAY stitching new kv lane with shape: %s", vmem_ref.shape)
   bkv_sz_cache = bkv_sz_frm_cache.astype(jnp.int32)
   new_tok_offset = new_kv_len_start.astype(jnp.int32) % cfgs.serve.page_size
   cache_pages = pl.cdiv(bkv_sz_cache, cfgs.serve.page_size)
 
   v_len = cfgs.bkv_sz + 2 * cfgs.serve.page_size
   vmem_u32_ref = vmem_ref.at[b_idx].bitcast(jnp.uint32)
-  logging.info("AJAY vmem_u32_ref shape: %s", vmem_u32_ref.shape)
 
   if cfgs.block.bq_sz == 1:
     return _stitch_decode_lane(

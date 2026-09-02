@@ -24,7 +24,6 @@ from collections.abc import Sequence
 from typing import Any
 import jax
 from jax import lax
-from jax.experimental import pallas as pl
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.mla.v3 import configs
 from tokamax._src.ops.experimental.mla.v3 import utils
@@ -64,16 +63,29 @@ def flash_attention_qk_softmax(
     bq_start: Block start offset for query within the sequence.
 
   Returns:
-    Tuple of (p, alpha_list, m_next, l_next) where p is softmax probability
-    tensor, alpha_list contains per-batch rescaling factors, m_next is updated
-    running max, and l_next is updated denominator.
+    Tuple of (p, alpha_list, m_carry, l_next).
+
+    `p` is the softmax probability tensor and `alpha_list` the per-batch
+    rescaling factors.
+
+    `m_carry` is **not** `m_next`. It is the running max left over after the
+    last lane of this block, *after* the end-of-sequence reset: when
+    `is_last_k[b]` is set, lane b's carry is forced to `-inf` so the next block
+    starts a fresh sequence rather than inheriting the finished one's max. The
+    unreset per-lane maxima used to normalize `p` are internal and are not
+    returned. `l_next` is the stacked per-lane denominator, and the caller
+    keeps only its last lane (`l_next[-1]`) as the carry.
   """
   b = q_nope.shape[0]
-  num_q_heads = cfgs.model.num_q_heads
-  n_q = q_nope.shape[1]  # num_q_heads * tq
-
-  # Consider supporting HEAD_ALONG_SUBLANE layout later.
-  assert cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE
+  # Rows of the Q block are laid out as `token * aligned_num_q_heads + head`
+  # (see `MlaConfigs.q_nope_vmem_shape`), so the row -> token map below must
+  # divide by the *padded* head count. Using `model.num_q_heads` skews every
+  # token index whenever `num_q_heads` is not a multiple of `packing_q`.
+  num_q_heads = cfgs.aligned_num_q_heads
+  n_q = q_nope.shape[1]  # aligned_num_q_heads * tq
+  assert n_q % num_q_heads == 0, (
+      f"Q block rows {n_q} not divisible by aligned head count {num_q_heads}"
+  )
 
   # 1. Compute QK dot products: S = Q_nope @ C_kv.T + Q_pe @ K_pe.T
 
@@ -154,7 +166,9 @@ def flash_attention_qk_softmax(
 
   l_next = jnp.stack(l_next_list, axis=0)
 
-  return p, alpha_list, m_prev, l_next
+  # `m_prev` here is the post-reset carry for the next block, not `m_next`.
+  m_carry = m_prev
+  return p, alpha_list, m_carry, l_next
 
 
 def flash_attention_pv(
@@ -176,10 +190,8 @@ def flash_attention_pv(
   Returns:
     Updated unnormalized output accumulator [B, H_q * T_q, d_nope].
   """
-  b, n_q, s = p.shape
+  b = p.shape[0]
 
-  assert cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE
-  d_nope = v.shape[-2]
   pv = lax.dot(
       p,
       v,
@@ -234,12 +246,17 @@ def chunked_flash_attention(
     cfgs: MLA configuration parameters (containing bq_sz and bq_c_sz).
 
   Returns:
-    Tuple of (m_next, l_next, o_next) containing updated running statistics and
-    accumulated outputs across all query sub-chunks.
+    Tuple of (m_carry, l_next, o_next).
+
+    Note the asymmetry, inherited from `flash_attention_qk_softmax`: `m_carry`
+    is rank-2 -- the single post-reset running max left after the *last* batch
+    lane -- whereas `l_next` and `o_next` are stacked per-lane and carry a
+    leading [B] axis. Callers therefore store `m_carry` directly but must take
+    `l_next[-1]` / `o_next[-1]` to get the corresponding carries.
   """
   q_split = cfgs.q_split
   if q_split == 1:
-    p, alpha_list, m_next, l_next = flash_attention_qk_softmax(
+    p, alpha_list, m_carry, l_next = flash_attention_qk_softmax(
         q_nope,
         q_pe,
         k_nope,
@@ -253,13 +270,13 @@ def chunked_flash_attention(
         bq_start=0,
     )
     o_next = flash_attention_pv(p, k_nope, alpha_list, o_prev, cfgs=cfgs)
-    return m_next, l_next, o_next
+    return m_carry, l_next, o_next
 
   total_q = q_nope.shape[1]
   q_chunk_len = total_q // q_split
   bq_sz_chunk = cfgs.bq_c_sz
 
-  m_next_splits = []
+  m_carry_splits = []
   l_next_splits = []
   o_next_splits = []
 
@@ -274,7 +291,7 @@ def chunked_flash_attention(
     l_prev_chunk = l_prev[start:end]
     o_prev_chunk = o_prev[start:end]
 
-    p_chunk, alpha_chunk, m_next_chunk, l_next_chunk = (
+    p_chunk, alpha_chunk, m_carry_chunk, l_next_chunk = (
         flash_attention_qk_softmax(
             q_nope_chunk,
             q_pe_chunk,
@@ -293,12 +310,14 @@ def chunked_flash_attention(
         p_chunk, k_nope, alpha_chunk, o_prev_chunk, cfgs=cfgs
     )
 
-    m_next_splits.append(m_next_chunk)
+    m_carry_splits.append(m_carry_chunk)
     l_next_splits.append(l_next_chunk)
     o_next_splits.append(o_next_chunk)
 
   return (
-      jnp.concatenate(m_next_splits, axis=0),
+      # `m_carry` chunks tile the query axis (axis 0); `l`/`o` chunks tile the
+      # query axis of a [B, ...] stack, hence axis 1.
+      jnp.concatenate(m_carry_splits, axis=0),
       jnp.concatenate(l_next_splits, axis=1),
       jnp.concatenate(o_next_splits, axis=1),
   )

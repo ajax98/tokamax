@@ -14,6 +14,8 @@
 
 """Unit tests for the MLA Metadata Scheduler runnable on CPU."""
 
+import dataclasses
+
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.mla.v3 import configs
 from tokamax._src.ops.experimental.mla.v3 import schedule
@@ -237,6 +239,237 @@ class MlaScheduleTest(parameterized.TestCase):
 
     expected_o_wait = (64 * mla_cfg.o_bytes_per_token) // 512
     self.assertEqual(int(sched.total_wait_o_out[0]), expected_o_wait)
+
+class ScheduleCapacityTest(parameterized.TestCase):
+  """The HBM schedule must be large enough that no flush is ever dropped.
+
+  `_write_schedule_to_hbm` skips a flush that would overrun the buffer, which
+  turns an out-of-bounds DMA into a silently truncated attention. The guard
+  cannot do better - Pallas DMA slice sizes are static Python ints, so a partial
+  flush is not expressible - so the buffer has to be sized correctly up front,
+  from `MlaConfigs.max_steps_needed`. These tests are that bound's evidence:
+  that it really does dominate what the scheduler emits, and that the sizing
+  actually consumes it.
+  """
+
+  def setUp(self):
+    super().setUp()
+    self.model_cfg = configs.MlaModelConfigs(
+        num_q_heads=128,
+        lkv_dim=512,
+        r_dim=64,
+        mask_value=-1e9,
+    )
+
+  def _configs(
+      self,
+      *,
+      num_seqs,
+      pages_per_seq,
+      page_size,
+      total_q_tokens,
+      bq_sz,
+      bkv_sz,
+      batch_size,
+      mode,
+      smem_fraction=0.33,
+  ):
+    return configs.MlaConfigs(
+        block=configs.BlockSizes(
+            bq_sz=bq_sz,
+            bq_c_sz=bq_sz,
+            bkv_sz=bkv_sz,
+            batch_size=batch_size,
+            n_buffer=2,
+        ),
+        model=self.model_cfg,
+        serve=configs.ServingConfigs(
+            num_seqs=num_seqs,
+            page_size=page_size,
+            total_q_tokens=total_q_tokens,
+            num_page_indices=num_seqs * pages_per_seq,
+            dtype_q=jnp.bfloat16,
+            dtype_kv=jnp.bfloat16,
+            dtype_out=jnp.bfloat16,
+            smem_fraction_limit_for_schedule_generation=smem_fraction,
+        ),
+        mode=mode,
+        vmem_limit_bytes=16 * 1024 * 1024,
+    )
+
+  # `kv_lens` are ragged and deliberately unaligned to `page_size` / `bkv_sz`,
+  # since a bound that only holds on round numbers is not a bound.
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="decode",
+          q_lens=[1, 1, 1, 1],
+          kv_lens=[17, 128, 250, 256],
+          pages_per_seq=2,
+          page_size=128,
+          bq_sz=1,
+          bkv_sz=128,
+          batch_size=2,
+          mode=configs.MlaCase.DECODE,
+      ),
+      dict(
+          # The split that saturates the bound: every sequence is one token
+          # long and its context fills the page table exactly, so no causal
+          # masking and no partial block gives anything back. Slack here is
+          # zero, which is what makes this case load-bearing - an off-by-one in
+          # `max_steps_needed` shows up as a failure rather than as headroom.
+          testcase_name="decode_at_the_bound",
+          q_lens=[1] * 8,
+          kv_lens=[512] * 8,
+          pages_per_seq=4,
+          page_size=128,
+          bq_sz=1,
+          bkv_sz=128,
+          batch_size=1,
+          mode=configs.MlaCase.DECODE,
+      ),
+      dict(
+          testcase_name="prefill",
+          q_lens=[64, 128, 200],
+          kv_lens=[64, 128, 200],
+          pages_per_seq=4,
+          page_size=64,
+          bq_sz=64,
+          bkv_sz=64,
+          batch_size=2,
+          mode=configs.MlaCase.PREFILL,
+      ),
+      dict(
+          # kv_len > q_len: chunked prefill, where the causal window starts part
+          # way into the cache and the q-block count no longer tracks the
+          # k-block count.
+          testcase_name="chunked_prefill",
+          q_lens=[64, 32],
+          kv_lens=[200, 256],
+          pages_per_seq=4,
+          page_size=64,
+          bq_sz=32,
+          bkv_sz=64,
+          batch_size=1,
+          mode=configs.MlaCase.MIXED,
+      ),
+      dict(
+          # One sequence carrying the whole token budget, which is the split
+          # that maximises q-blocks per sequence rather than sequence count.
+          testcase_name="single_long_sequence",
+          q_lens=[0, 0, 384],
+          kv_lens=[0, 0, 384],
+          pages_per_seq=4,
+          page_size=128,
+          bq_sz=32,
+          bkv_sz=128,
+          batch_size=4,
+          mode=configs.MlaCase.PREFILL,
+      ),
+  )
+  def test_bound_dominates_emitted_steps(
+      self,
+      q_lens,
+      kv_lens,
+      pages_per_seq,
+      page_size,
+      bq_sz,
+      bkv_sz,
+      batch_size,
+      mode,
+  ):
+    num_seqs = len(q_lens)
+    cfgs = self._configs(
+        num_seqs=num_seqs,
+        pages_per_seq=pages_per_seq,
+        page_size=page_size,
+        total_q_tokens=sum(q_lens),
+        bq_sz=bq_sz,
+        bkv_sz=bkv_sz,
+        batch_size=batch_size,
+        mode=mode,
+    )
+    cu_q_lens = [0]
+    for q_len in q_lens:
+      cu_q_lens.append(cu_q_lens[-1] + q_len)
+
+    match mode:
+      case configs.MlaCase.DECODE:
+        distribution = [num_seqs, num_seqs, num_seqs]
+      case configs.MlaCase.PREFILL:
+        distribution = [0, num_seqs, num_seqs]
+      case configs.MlaCase.MIXED:
+        distribution = [0, 0, num_seqs]
+
+    sched = schedule.generate_mla_metadata(
+        jnp.array(cu_q_lens, dtype=jnp.int32),
+        jnp.array(kv_lens, dtype=jnp.int32),
+        jnp.arange(num_seqs * pages_per_seq, dtype=jnp.int32),
+        jnp.array(distribution, dtype=jnp.int32),
+        cfgs,
+        interpret=True,
+    )
+
+    self.assertLessEqual(int(sched.actual_steps[0]), cfgs.max_steps_needed)
+    # `actual_steps` is clamped to the buffer capacity, so it would satisfy the
+    # assertion above for free if the buffer were undersized. Check separately
+    # that the capacity is not what made it fit.
+    self.assertLessEqual(
+        cfgs.max_steps_needed,
+        cfgs.max_steps_ub * cfgs.max_schedule_size_multiplier,
+    )
+
+  def test_multiplier_is_raised_when_the_shape_needs_it(self):
+    """A shape too big for the configured multiplier grows it, not truncates."""
+    # A zero SMEM budget pins `max_steps_ub` to its floor of one lane group,
+    # which makes the arithmetic here independent of the host's SMEM size, and
+    # `max_schedule_size_multiplier=1` removes the 16x headroom that would
+    # otherwise absorb any shape this test could reasonably build.
+    kwargs = dict(
+        num_seqs=128,
+        pages_per_seq=32,
+        page_size=256,
+        total_q_tokens=128,
+        bq_sz=1,
+        bkv_sz=512,
+        batch_size=2,
+        mode=configs.MlaCase.DECODE,
+        smem_fraction=0.0,
+    )
+    cfgs = self._configs(**kwargs)
+    cfgs = dataclasses.replace(
+        cfgs,
+        serve=dataclasses.replace(
+            cfgs.serve, max_schedule_size_multiplier=1
+        ),
+    )
+
+    # 128 one-token sequences x cdiv(8192, 512) k-blocks / 2 lanes.
+    self.assertEqual(cfgs.max_steps_needed, 1024)
+    self.assertGreater(cfgs.max_steps_needed, cfgs.max_steps_ub)
+    self.assertGreater(cfgs.max_schedule_size_multiplier, 1)
+    self.assertGreaterEqual(
+        cfgs.max_steps_ub * cfgs.max_schedule_size_multiplier,
+        cfgs.max_steps_needed,
+    )
+
+  def test_configured_multiplier_is_a_floor_not_an_override(self):
+    """Sizing never shrinks the buffer below what the caller asked for."""
+    cfgs = self._configs(
+        num_seqs=3,
+        pages_per_seq=32,
+        page_size=256,
+        total_q_tokens=3,
+        bq_sz=1,
+        bkv_sz=512,
+        batch_size=2,
+        mode=configs.MlaCase.DECODE,
+    )
+    self.assertLess(cfgs.max_steps_needed, cfgs.max_steps_ub)
+    self.assertEqual(
+        cfgs.max_schedule_size_multiplier,
+        cfgs.serve.max_schedule_size_multiplier,
+    )
+
 
 if __name__ == "__main__":
   absltest.main()

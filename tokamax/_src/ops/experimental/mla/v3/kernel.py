@@ -14,12 +14,8 @@
 # ==============================================================================
 """TPU-Friendly MLA Ragged Paged Attention kernel v3 (Transposed KV Cache)."""
 
-from collections.abc import Sequence
 import dataclasses
 import functools
-import math
-import os
-from typing import Any, overload
 
 from absl import logging
 import jax
@@ -34,134 +30,7 @@ from tokamax._src.ops.experimental.mla.v3 import schedule
 from tokamax._src.ops.experimental.mla.v3 import stitch_utils
 from tokamax._src.ops.experimental.mla.v3 import utils
 
-logger = logging
-
 MlaCase = configs.MlaCase
-
-
-# ==============================================================================
-# Helper functions
-# ==============================================================================
-
-
-@overload
-def unsigned_mod(a: int, b: int) -> int:
-  ...
-
-
-@overload
-def unsigned_mod(a: jax.Array, b: int) -> jax.Array:
-  ...
-
-
-def unsigned_mod(a: Any, b: int) -> Any:
-  exponent = int(math.log2(b))
-  if b == int(math.pow(2, exponent)):
-    # Use bitmask instead of modulo for efficiency.
-    return a & (b - 1)
-  return a % b
-
-
-@overload
-def unsigned_cdiv(a: int, b: int) -> int:
-  ...
-
-
-@overload
-def unsigned_cdiv(a: jax.Array, b: int) -> jax.Array:
-  ...
-
-
-def unsigned_cdiv(a: Any, b: int) -> Any:
-  exponent = int(math.log2(b))
-  if b == int(math.pow(2, exponent)):
-    # Use bit shift instead of division for efficiency.
-    return (a + b - 1) >> exponent
-  return (a + b - 1) // b
-
-
-@overload
-def unsigned_floor_div(a: int, b: int) -> int:
-  ...
-
-
-@overload
-def unsigned_floor_div(a: jax.Array, b: int) -> jax.Array:
-  ...
-
-
-def unsigned_floor_div(a: Any, b: int) -> Any:
-  exponent = int(math.log2(b))
-  if b == int(math.pow(2, exponent)):
-    # Use bit shift instead of division for efficiency.
-    return a >> exponent
-  return a // b
-
-
-@overload
-def unsigned_align_to(a: int, b: int) -> int:
-  ...
-
-
-@overload
-def unsigned_align_to(a: jax.Array, b: int) -> jax.Array:
-  ...
-
-
-def unsigned_align_to(a: Any, b: int) -> Any:
-  exponent = int(math.log2(b))
-  if b == int(math.pow(2, exponent)):
-    # Use bitmask instead of division and multiply for efficiency.
-    return (a + b - 1) & (-int(b))
-
-  return unsigned_cdiv(a, b) * b
-
-
-@overload
-def align_to(a: int, b: int) -> int:
-  ...
-
-
-@overload
-def align_to(a: jax.Array, b: int) -> jax.Array:
-  ...
-
-
-def align_to(a: Any, b: int) -> Any:
-  return ((a + b - 1) // b) * b
-
-
-def get_dtype_bitwidth(dtype: jnp.dtype | str | Any) -> int:
-  return jax.dtypes.itemsize_bits(dtype)
-
-
-def get_dtype_packing(dtype: jnp.dtype | str | Any) -> int:
-  bits = get_dtype_bitwidth(dtype)
-  return 32 // bits
-
-
-def get_kv_cache_shape(
-    total_num_pages: int,
-    page_size: int,
-    kv_dim: int,
-    kv_dtype: jnp.dtype | str | Any | None = None,
-    kv_packing: int | None = None,
-) -> tuple[int, int, int, int]:
-  """Computes the 4D transposed paged KV cache tensor shape."""
-  if kv_packing is None and kv_dtype is not None:
-    kv_packing = get_dtype_packing(kv_dtype)
-  elif kv_packing is None:
-    kv_packing = 1
-
-  assert page_size % 128 == 0
-  aligned_kv_dim = unsigned_align_to(kv_dim, 128)
-  assert aligned_kv_dim % kv_packing == 0
-  return (
-      total_num_pages,
-      aligned_kv_dim // kv_packing,
-      kv_packing,
-      page_size,
-  )
 
 
 # ==============================================================================
@@ -295,6 +164,25 @@ def static_validate_inputs(
   if distribution.shape != (3,):
     raise ValueError(f"Expected {distribution.shape=} to be (3,).")
 
+  # `page_size_log2` implements `//` as a shift, which is only equivalent for
+  # powers of two. A multiple of 128 is not enough (e.g. 384).
+  if page_size & (page_size - 1) != 0:
+    raise ValueError(f"Expected {page_size=} to be a power of two.")
+
+  if cfgs.serve.page_size != page_size:
+    raise ValueError(
+        f"Config {cfgs.serve.page_size=} disagrees with the cache_kv minor"
+        f" dimension {page_size=}."
+    )
+
+  # `bkv_p` is `cdiv(bkv_sz, page_size)`, so a non-multiple would silently round
+  # the block up and make every DMA offset computed from `bkv_p * page_size`
+  # disagree with the `bkv_sz` the softmax masks against.
+  if cfgs.bkv_sz % page_size != 0:
+    raise ValueError(
+        f"Expected {cfgs.bkv_sz=} to be a multiple of {page_size=}."
+    )
+
   if cfgs.model.sliding_window is not None and cfgs.model.sliding_window <= 0:
     raise ValueError(f"{cfgs.model.sliding_window=} must be positive.")
   if cfgs.model.soft_cap is not None and cfgs.model.soft_cap == 0.0:
@@ -307,9 +195,9 @@ def prepare_q_inputs(
     q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim],
 ) -> jax.Array:
   max_num_tokens, actual_num_q_heads, actual_head_dim = q.shape
-  packing_q = get_dtype_packing(q.dtype)
-  num_q_heads = align_to(actual_num_q_heads, packing_q)
-  head_dim = align_to(actual_head_dim, 128)
+  packing_q = utils.get_dtype_packing(q.dtype)
+  num_q_heads = utils.align_to(actual_num_q_heads, packing_q)
+  head_dim = utils.align_to(actual_head_dim, 128)
   q = jnp.pad(
       q,
       (
@@ -333,12 +221,12 @@ def prepare_q_nope_inputs(
   """
   del vmem_limit_bytes
   actual_num_q_heads, actual_max_num_tokens, actual_head_dim = q.shape
-  packing_q = get_dtype_packing(q.dtype)
-  num_q_heads = align_to(actual_num_q_heads, packing_q)
-  head_dim = align_to(actual_head_dim, 128)
+  packing_q = utils.get_dtype_packing(q.dtype)
+  num_q_heads = utils.align_to(actual_num_q_heads, packing_q)
+  head_dim = utils.align_to(actual_head_dim, 128)
 
   sublane_multiple = packing_q * 8
-  max_num_tokens = align_to(actual_max_num_tokens, sublane_multiple)
+  max_num_tokens = utils.align_to(actual_max_num_tokens, sublane_multiple)
   q = jnp.pad(
       q,
       (
@@ -361,14 +249,14 @@ def prepare_kv_inputs_for_transposed_kv_cache(
   """Pads and transposes new KV inputs to [sublanes, kv_packing, max_num_tokens]."""
   max_num_tokens, actual_head_dim = kv.shape
   if kv_packing is None:
-    kv_packing = get_dtype_packing(kv.dtype)
+    kv_packing = utils.get_dtype_packing(kv.dtype)
 
   pad_multiple = max(128, page_size)
   if max_num_tokens % pad_multiple != 0:
     pad = pad_multiple - (max_num_tokens % pad_multiple)
     kv = jnp.pad(kv, ((0, pad), (0, 0)), constant_values=0)
 
-  aligned_head_dim = align_to(actual_head_dim, 128)
+  aligned_head_dim = utils.align_to(actual_head_dim, 128)
   if aligned_head_dim != actual_head_dim:
     pad = aligned_head_dim - actual_head_dim
     kv = jnp.pad(kv, ((0, 0), (0, pad)), constant_values=0)
@@ -388,9 +276,9 @@ def prepare_outputs(
 ) -> jax.Array:
   """Physically transposes output activations back to head-major layout."""
   del vmem_limit_bytes
-  packing_q = get_dtype_packing(out.dtype)
-  num_q_heads = align_to(actual_num_q_heads, packing_q)
-  head_dim = align_to(actual_head_dim, 128)
+  packing_q = utils.get_dtype_packing(out.dtype)
+  num_q_heads = utils.align_to(actual_num_q_heads, packing_q)
+  head_dim = utils.align_to(actual_head_dim, 128)
   out = out.reshape((out.shape[0], num_q_heads, head_dim))
   out = jnp.transpose(out, (1, 0, 2))
   return out[:actual_num_q_heads, :actual_max_num_tokens, :actual_head_dim]
@@ -403,6 +291,8 @@ def prepare_outputs(
 
 def create_allocs(
     cache_kv_hbm_ref: jax.Ref,
+    ql_nope_hbm_ref: jax.Ref,
+    q_pe_hbm_ref: jax.Ref,
     o_hbm_ref: jax.Ref,
     cfgs: configs.MlaConfigs,
 ):
@@ -439,16 +329,21 @@ def create_allocs(
       use_lookahead=True,
       cfgs=cfgs,
   )
+  # Each buffered ref takes its element type from the HBM ref it stages, not
+  # from the output ref. `ql_nope_hbm_ref` happens to alias `o_hbm_ref` (see
+  # `input_output_aliases` below), but `q_pe_hbm_ref` does not, so sourcing its
+  # dtype from the output would allocate the wrong-width VMEM buffer whenever
+  # `dtype_out != dtype_q`.
   q_nope_alloc = bref_override.BatchingQNopeRef.input(
       spec=q_nope_spec,
-      dtype_or_type=o_hbm_ref,
+      dtype_or_type=ql_nope_hbm_ref,
       buffer_count=cfgs.n_buffer,
       use_lookahead=True,
       cfgs=cfgs,
   )
   q_pe_alloc = bref_override.BatchingQPeRef.input(
       spec=q_pe_spec,
-      dtype_or_type=o_hbm_ref,
+      dtype_or_type=q_pe_hbm_ref,
       buffer_count=cfgs.n_buffer,
       use_lookahead=True,
       cfgs=cfgs,
@@ -557,24 +452,25 @@ def mla_body(
     bkv_sz_frm_cache_list.append(bkv_sz_frm_cache)
     new_kv_len_start_list.append(new_kv_len_start)
 
-  if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-    stitch_results = []
-    for b_idx in range(cfgs.batch_size):
-      res = stitch_utils.stitch_new_kv_lane(
+  # Loads for every lane are issued before any store, per
+  # `stitch_new_kv_lane`'s "separated to avoid RAW hazards".
+  stitch_results = [
+      stitch_utils.stitch_new_kv_lane(
           kv_in_vref,
           b_idx,
           bkv_sz_frm_cache_list[b_idx],
           new_kv_len_start_list[b_idx],
           cfgs=cfgs,
       )
-      stitch_results.append(res)
-    for b_idx in range(cfgs.batch_size):
-      stitch_utils.store_new_kv_lane(
-          kv_in_vref,
-          b_idx,
-          stitch_results[b_idx],
-          cfgs=cfgs,
-      )
+      for b_idx in range(cfgs.batch_size)
+  ]
+  for b_idx in range(cfgs.batch_size):
+    stitch_utils.store_new_kv_lane(
+        kv_in_vref,
+        b_idx,
+        stitch_results[b_idx],
+        cfgs=cfgs,
+    )
 
   lkv_sublanes = cfgs.aligned_lkv_dim // cfgs.serve.packing_kv
   q_nope = q_nope_vref[...].reshape(cfgs.batch_size, -1, cfgs.aligned_lkv_dim)
@@ -591,7 +487,7 @@ def mla_body(
       schedule_ref.is_last_k[step, b] == 1 for b in range(cfgs.batch_size)
   ]
 
-  m_next, l_next, acc_next = flash_attention.chunked_flash_attention(
+  m_carry, l_next, acc_next = flash_attention.chunked_flash_attention(
       q_nope=q_nope,
       q_pe=q_pe,
       k_nope=c_kv,
@@ -614,7 +510,13 @@ def mla_body(
       cfgs=cfgs,
   )
 
-  m_scratch_ref[...] = m_next
+  # The indexing asymmetry is deliberate, not a bug. `chunked_flash_attention`
+  # already collapses the running max over the serially-chained batch lanes and
+  # applies the end-of-sequence reset, so `m_carry` is the next block's carry
+  # as-is. `l_next` and `acc_next` are still stacked per lane, so the carry is
+  # the last lane. Indexing `m_carry[-1]` would slice a query row; dropping the
+  # `[-1]` on the other two would write a rank-mismatched stack.
+  m_scratch_ref[...] = m_carry
   l_scratch_ref[...] = l_next[-1]
   acc_scratch_ref[...] = acc_next[-1]
 
@@ -675,7 +577,7 @@ def _mla_ragged_paged_attention_kernel(
     del o_kv_cache_hbm_ref
 
     q_nope_alloc, q_pe_alloc, kv_cache_alloc, o_alloc = create_allocs(
-        cache_kv_hbm_ref, o_hbm_ref, cfgs
+        cache_kv_hbm_ref, ql_nope_hbm_ref, q_pe_hbm_ref, o_hbm_ref, cfgs
     )
 
     actual_steps = schedule_hbm_ref.actual_steps[0]

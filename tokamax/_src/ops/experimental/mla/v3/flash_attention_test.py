@@ -43,6 +43,16 @@ class FlashAttentionMathTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
+    # These are math tests: they check the online-softmax recurrence against a
+    # plain `jnp.einsum` reference. On a TPU the default matmul precision runs
+    # float32 inputs through the MXU in bf16 passes, which puts ~0.5% between
+    # the two sides - not because the recurrence is wrong, but because the two
+    # sides reach the MXU by different routes. (`test_chunked_query_splitting`
+    # holds at rtol=1e-5 on the same hardware precisely because it compares
+    # flash against flash, so the MXU error cancels.) Pinning the precision
+    # keeps the tolerances tight enough to catch a real accumulation bug.
+    self.enterContext(jax.default_matmul_precision("highest"))
+
     self.batch_size = 1
     self.num_q_heads = 4
     self.lkv_dim = 512

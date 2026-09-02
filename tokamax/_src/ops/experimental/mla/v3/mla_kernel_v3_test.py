@@ -24,10 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 from tokamax._src.ops.experimental.mla import test_base
 from tokamax._src.ops.experimental.mla.v2 import kernel as kernel_v2
-from tokamax._src.ops.experimental.mla.v3 import configs
-from tokamax._src.ops.experimental.mla.v3 import kernel as kernel_v3
 from tokamax._src.ops.experimental.mla.v3 import mla_wrapper
-from tokamax._src.ops.experimental.mla.v3 import schedule
 from tokamax._src.ops.experimental.mla.v3 import utils
 
 FLAGS = flags.FLAGS
@@ -61,6 +58,7 @@ class MlaRaggedPagedAttentionKernelV3Test(
       q_scale: float | None = None,
       k_scale: float | None = None,
       v_scale: float | None = None,
+      distribution_override: tuple[int, int, int] | None = None,
   ):
     if not jax.devices() or jax.devices()[0].platform != "tpu":
       self.skipTest("Expect TPU")
@@ -91,6 +89,13 @@ class MlaRaggedPagedAttentionKernelV3Test(
         num_pages,
         rng=rng,
     )
+
+    if distribution_override is not None:
+      # `generate_mla_inputs` always emits `[d, d, n]`, i.e. an empty
+      # pure-prefill band. The reference only reads `distribution[-1]`, so
+      # re-banding the same sequences leaves the expected output unchanged and
+      # isolates whether the kernel honours the band it is given.
+      distribution = jnp.array(distribution_override, dtype=jnp.int32)
 
     padded_r_dim = test_base.align_to(r_dim, 128)
     padded_lkv_dim = test_base.align_to(lkv_dim, 128)
@@ -220,6 +225,62 @@ class MlaRaggedPagedAttentionKernelV3Test(
 
     np.testing.assert_allclose(expected_out, kernel_out, atol=0.1, rtol=0.2)
     gc.collect()
+
+  def test_ragged_paged_attention_unaligned_num_q_heads(
+      self, dtype=jnp.bfloat16
+  ):
+    """Head count not divisible by `packing_q`, so `H_pad != H`.
+
+    Every other case uses 128 heads, which every `packing_q` (1/2/4) divides, so
+    the padded and unpadded head counts coincide and the causal mask's
+    row -> token division cannot be caught getting the divisor wrong.
+    """
+    seq_lens = [
+        (1, 129),
+        (1, 122),
+        (5, 18),
+        (32, 322),
+        (3, 1229),
+    ]
+    self._test_mla_ragged_paged_attention(
+        seq_lens,
+        127,  # num_heads; bf16 packing_q = 2, so aligned_num_q_heads = 128.
+        512,  # lkv_dim
+        64,  # r_dim
+        128,  # page_size
+        dtype,
+        self.kv_dtype,
+        1024,  # num_pages
+    )
+
+  def test_ragged_paged_attention_nonempty_prefill_band(
+      self, dtype=jnp.bfloat16
+  ):
+    """`distribution[1] > distribution[0]`, i.e. a real pure-prefill band.
+
+    Sequences 2 and 3 are routed through the PREFILL pass rather than MIXED.
+    Note that their `kv_len > q_len`, so this also covers chunked prefill, where
+    the earlier chunks live in the paged cache and must still be attended to.
+    """
+    seq_lens = [
+        (1, 129),
+        (1, 122),
+        (32, 322),
+        (120, 597),
+        (5, 18),
+        (3, 1229),
+    ]
+    self._test_mla_ragged_paged_attention(
+        seq_lens,
+        128,  # num_heads
+        512,  # lkv_dim
+        64,  # r_dim
+        128,  # page_size
+        dtype,
+        self.kv_dtype,
+        1024,  # num_pages
+        distribution_override=(2, 4, len(seq_lens)),
+    )
 
 
 if __name__ == "__main__":

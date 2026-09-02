@@ -28,14 +28,6 @@ def get_tpu_num_lanes() -> int:
     return 128
 
 
-def get_tpu_num_sublanes() -> int:
-  """Returns physical TPU vector sublanes (defaults to 8 on CPU/test runner)."""
-  try:
-    return pltpu.get_tpu_info().num_sublanes
-  except (ValueError, AttributeError):
-    return 8
-
-
 def get_tpu_smem_capacity_bytes() -> int:
   """Returns SMEM capacity in bytes (defaults to 16MB on CPU/test runner)."""
   try:
@@ -67,50 +59,6 @@ def broadcast_minor(src, shape):
 def get_dtype_packing(dtype):
   """Returns number of packed elements per 32-bit word."""
   return 32 // jax.dtypes.itemsize_bits(dtype)
-
-
-def has_bank_conflicts(stride: int) -> bool:
-  """Checks if a stride causes VMEM bank conflicts on TPU."""
-  return stride % 8 == 0
-
-
-def strided_load(ref, start_row, num_rows, step, *, dtype=None):
-  """Loads data from HBM with strided access, handling 128-lane alignment."""
-  _, row_width = ref.shape
-  num_lanes = get_tpu_num_lanes()
-  num_sub_lanes = row_width // num_lanes
-  ref_flat = ref.reshape(-1, num_lanes)
-
-  v_start = start_row * num_sub_lanes
-  v_num = num_rows * num_sub_lanes
-  v_step = step * num_sub_lanes
-
-  chunks = [
-      ref_flat[pl.ds(v_start + i, v_num // v_step, v_step)]
-      for i in range(num_sub_lanes)
-  ]
-  vec = jnp.concat(chunks, axis=1)
-  return pltpu.bitcast(vec, dtype) if dtype is not None else vec
-
-
-def strided_store(ref, start, sz, step, val):
-  """Stores data to HBM with strided access, handling 128-lane alignment."""
-  assert get_dtype_packing(ref.dtype) == 1
-  assert ref.dtype == val.dtype
-  assert ref.shape == val.shape
-  assert ref.ndim == 2
-  rows, cols = ref.shape
-  num_lanes = get_tpu_num_lanes()
-  assert cols % num_lanes == 0
-  folds = cols // num_lanes
-  ref = ref.reshape(rows * folds, num_lanes)
-  start *= folds
-  sz *= folds
-  step *= folds
-  assert sz % step == 0
-  for i in range(folds):
-    val_slice = val[:, i * num_lanes : (i + 1) * num_lanes]
-    ref[pl.ds(start + i, sz // step, step)] = val_slice
 
 
 def transpose_kv_cache_to_v3(

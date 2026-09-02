@@ -14,18 +14,24 @@
 
 """Wrapper for MLA v3 kernel to orchestrate multi-phase batch execution."""
 
-import functools
 from absl import logging
 import jax
 from jax import lax
-from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 
 from tokamax._src.ops.experimental.mla.v3 import configs
 from tokamax._src.ops.experimental.mla.v3 import kernel
 from tokamax._src.ops.experimental.mla.v3 import schedule
-from tokamax._src.ops.experimental.mla.v3 import utils
+
+
+# Matches `v2/kernel.py`'s DEFAULT_MASK_VALUE. Deliberately not
+# `finfo(float32).min`: the masked logits are fed straight into the online
+# softmax, and a value that close to the representable limit turns the
+# `s - m` subtraction into -inf (and then 0 * inf -> NaN) for any block whose
+# rows are entirely masked. 0.7 of the max leaves room for that subtraction
+# while still driving exp() to zero.
+DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 
 
 def calculate_block_sizes(
@@ -77,14 +83,15 @@ def mla_ragged_paged_attention(
     v_scale: float | None = None,
     num_kv_pages_per_block: int = 2,
     num_queries_per_block: int = 4,
+    batch_size: int = 2,
+    n_buffer: int = 2,
     decode_block_sizes: configs.BlockSizes | None = None,
     prefill_block_sizes: configs.BlockSizes | None = None,
     vmem_limit_bytes: int | None = None,
     debug_mode: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
-  """MLA Ragged paged attention with multi-phase (Decode -> Mixed) orchestration."""
+  """MLA Ragged paged attention, orchestrated as Decode -> Prefill -> Mixed."""
   actual_num_q_heads, total_q_tokens, actual_lkv_dim = ql_nope.shape
-  is_head_first = True
 
   actual_r_dim = q_pe.shape[-1]
   max_num_seqs = kv_lens.shape[0]
@@ -93,7 +100,7 @@ def mla_ragged_paged_attention(
   if vmem_limit_bytes is None:
     vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
   if mask_value is None:
-    mask_value = float(jnp.finfo(jnp.float32).min)
+    mask_value = DEFAULT_MASK_VALUE
 
   page_size = cache_kv.shape[-1]
 
@@ -124,6 +131,8 @@ def mla_ragged_paged_attention(
       serve_cfgs,
       num_kv_pages_per_block=num_kv_pages_per_block,
       num_queries_per_block=num_queries_per_block,
+      batch_size=batch_size,
+      n_buffer=n_buffer,
   )
 
   init_cfgs = configs.MlaConfigs(
@@ -170,7 +179,8 @@ def mla_ragged_paged_attention(
         if mode == configs.MlaCase.DECODE
         else prefill_block_sizes or default_prefill
     )
-    logging.info("blocks: %s, mode: %s", effective_blocks, mode)
+    if debug_mode:
+      logging.info("blocks: %s, mode: %s", effective_blocks, mode)
     cfgs = configs.MlaConfigs(
         block=effective_blocks,
         model=model_cfgs,
@@ -195,23 +205,40 @@ def mla_ragged_paged_attention(
     )
 
   num_decode = distribution[0]
+  num_prefill = distribution[1] - distribution[0]
   num_mixed = distribution[2] - distribution[1]
 
-  # Pass 1: Decode (runs sequences 0..distribution[0]-1 only if num_decode > 0)
-  ql_nope_prep, cache_kv = lax.cond(
-      num_decode > 0,
-      lambda q_kv: run_mla_kernel(configs.MlaCase.DECODE, q_kv[0], q_kv[1]),
-      lambda q_kv: q_kv,
-      (ql_nope_prep, cache_kv),
-  )
+  if debug_mode:
+    logging.info(
+        "Prepared inputs for MLA: ql_nope=%s, q_pe=%s, new_kv_c=%s,"
+        " new_k_pe=%s, cache_kv=%s",
+        ql_nope_prep.shape,
+        q_pe_prep.shape,
+        new_kv_c_prep.shape,
+        new_k_pe_prep.shape,
+        cache_kv.shape,
+    )
 
-  # Pass 2: Mixed (runs sequences distribution[1]..total_seqs-1 only if num_mixed > 0)
-  o_hbm, cache_kv = lax.cond(
-      num_mixed > 0,
-      lambda q_kv: run_mla_kernel(configs.MlaCase.MIXED, q_kv[0], q_kv[1]),
-      lambda q_kv: q_kv,
-      (ql_nope_prep, cache_kv),
-  )
+  # `distribution` partitions the sequences into three contiguous bands:
+  #   [0, d0)   decode          -- q_len == 1
+  #   [d0, d1)  chunked prefill -- q_len > 1, static
+  #   [d1, d2)  mixed
+  # Each band gets its own pass, chaining `ql_nope_prep` (which aliases the
+  # output buffer) and `cache_kv` so later passes see earlier writes. The
+  # prefill band used to be skipped entirely, which silently dropped those
+  # sequences from the output whenever d1 > d0.
+  def run_pass(mode, carry, predicate):
+    return lax.cond(
+        predicate,
+        lambda q_kv: run_mla_kernel(mode, q_kv[0], q_kv[1]),
+        lambda q_kv: q_kv,
+        carry,
+    )
+
+  carry = (ql_nope_prep, cache_kv)
+  carry = run_pass(configs.MlaCase.DECODE, carry, num_decode > 0)
+  carry = run_pass(configs.MlaCase.PREFILL, carry, num_prefill > 0)
+  o_hbm, cache_kv = run_pass(configs.MlaCase.MIXED, carry, num_mixed > 0)
 
   output = kernel.prepare_outputs(
       o_hbm,

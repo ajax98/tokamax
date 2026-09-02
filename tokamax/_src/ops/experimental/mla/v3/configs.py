@@ -22,9 +22,7 @@ import dataclasses
 import enum
 from typing import Any
 
-import jax
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.mla.v3 import utils
 
@@ -37,7 +35,10 @@ class BlockSizes:
     bq_sz: Query block size (number of sequence tokens per Q block).
     bq_c_sz: Chunked query block size for split execution.
     bkv_sz: KV cache block size (number of context tokens processed per step).
-    batch_size: Number of physical TPU batch lanes executing in parallel.
+    batch_size: Number of batch lanes packed into one kernel step. The lanes are
+      chained *serially* within a step -- lane i's online-softmax state (m, l,
+      acc) is rolled forward into lane i+1 -- so this is a work-per-step /
+      DMA-overlap knob, not a parallelism knob.
     n_buffer: Pipelining buffer depth (e.g. 2 for double buffering).
   """
 
@@ -78,40 +79,33 @@ class MlaModelConfigs:
   soft_cap: float | None = None
   sliding_window: int | None = None
 
-  @property
-  def total_q_dim(self) -> int:
-    """Total query vector dimension d_q = d_nope + d_pe."""
-    return self.lkv_dim + self.r_dim
-
-  @property
-  def total_kv_dim(self) -> int:
-    """Total combined KV vector dimension d_kv = d_nope + d_pe."""
-    return self.lkv_dim + self.r_dim
-
 
 class KVLayout(enum.StrEnum):
   """Memory layout of the paged KV cache in HBM and VMEM.
 
-  - HEAD_ALONG_SUBLANE: Latent dimension is aligned along 128 TPU physical
-  lanes;
-      sequence tokens are indexed along outer dimensions. Optimal for large
-      prefill.
   - SEQ_ALONG_LANE: Sequence tokens are packed along the 128 TPU physical lanes;
       latent dimension is on sublanes. Optimal for autoregressive decode
       (saturates
       128x128 systolic array across query heads when Q_len = 1).
+
+  This is the only layout v3 implements, and the enum exists to name it rather
+  than to offer a choice. A `HEAD_ALONG_SUBLANE` member - latent dimension along
+  the lanes, sequence tokens on outer dimensions, which would suit large prefill
+  - used to sit alongside it, branched for in four files but never finished:
+  `dma_kv_new_size` reserved 4 int32 descriptor fields for it while
+  `schedule.MlaSchedule.create_shape_dtype` unconditionally allocated the
+  5-field `SeqAlongLaneDmaNew`, so `SmemArrayOfStructs.create_shape_dtype`
+  asserted before the layout could run at all - and `flash_attention` asserted
+  SEQ_ALONG_LANE outright besides. Those branches were deleted rather than left
+  to read as a working alternative; git history has them if the layout is ever
+  picked up again.
   """
 
-  HEAD_ALONG_SUBLANE = enum.auto()
   SEQ_ALONG_LANE = enum.auto()
 
   @property
   def symbol(self) -> str:
-    match self:
-      case KVLayout.HEAD_ALONG_SUBLANE:
-        return "nhs"
-      case KVLayout.SEQ_ALONG_LANE:
-        return "snh"
+    return "snh"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -132,10 +126,12 @@ class ServingConfigs:
     scale_q: Optional scalar quantization multiplier for Q.
     scale_k: Optional scalar quantization multiplier for K.
     scale_v: Optional scalar quantization multiplier for V.
-    kv_layout: Paged memory layout (HEAD_ALONG_SUBLANE or SEQ_ALONG_LANE).
+    kv_layout: Paged memory layout. Only SEQ_ALONG_LANE is implemented.
     smem_fraction_limit_for_schedule_generation: SMEM budget limit fraction.
-    max_schedule_size_multiplier: Multiplier for maximum schedule steps upper
-      bound.
+    max_schedule_size_multiplier: Floor on the multiplier sizing the HBM
+      schedule, in units of `MlaConfigs.max_steps_ub`. Raising it only
+      over-allocates; `MlaConfigs.max_schedule_size_multiplier` already raises
+      it on its own for any shape that provably needs more.
   """
 
   num_seqs: int
@@ -148,7 +144,7 @@ class ServingConfigs:
   scale_q: float | None = None
   scale_k: float | None = None
   scale_v: float | None = None
-  kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE
+  kv_layout: KVLayout = KVLayout.SEQ_ALONG_LANE
   smem_fraction_limit_for_schedule_generation: float = 0.33
   max_schedule_size_multiplier: int = 16
 
@@ -159,10 +155,6 @@ class ServingConfigs:
   @property
   def page_size_log2(self) -> int:
     return (self.page_size - 1).bit_length()
-
-  @property
-  def page_size_mask(self) -> int:
-    return self.page_size - 1
 
   @property
   def packing_q(self) -> int:
@@ -283,12 +275,14 @@ class MlaConfigs:
   def bkv_p_cache(self) -> int:
     """Number of pages to fetch from the existing cached KV table per step.
 
-    In PREFILL mode, existing cache is not fetched. In DECODE and MIXED, we
-    fetch
-    at most bkv_p pages (since cached pages are already pre-sliced at offset 0).
+    At most bkv_p pages, since cached pages are already pre-sliced at offset 0.
+
+    This used to return 0 in PREFILL mode on the assumption that a prefill
+    sequence has no history. That only holds for a *whole-prompt* prefill; under
+    chunked prefill the earlier chunks are already in the paged cache
+    (kv_len > q_len) and skipping the cache fetch silently drops them from the
+    attention. PREFILL therefore fetches the cache exactly like MIXED.
     """
-    if self.mode == MlaCase.PREFILL:
-      return 0
     return self.bkv_p
 
   @property
@@ -297,26 +291,21 @@ class MlaConfigs:
 
     - In DECODE (bq_sz = 1): Exactly 1 new token is decoded, spanning at most 1
     page.
-    - In SEQ_ALONG_LANE: Unaligned sequence starts in unpaged HBM can straddle
-      across an extra page boundary, requiring (bkv_p + 1) page fetches.
-    - In HEAD_ALONG_SUBLANE: Row-contiguous 1D slices do not straddle (bkv_p
-    pages).
+    - Otherwise: unaligned sequence starts in unpaged HBM can straddle across an
+      extra page boundary, requiring (bkv_p + 1) page fetches.
     """
     if self.mode == MlaCase.DECODE or self.block.bq_sz == 1:
       return 1
-    if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
-      return self.bkv_p + 1
-    return self.bkv_p
+    return self.bkv_p + 1
 
   @property
   def dma_kv_new_size(self) -> int:
     """Number of int32 descriptor fields per new-token DMA struct entry.
 
-    - SEQ_ALONG_LANE: 5 fields (fetch_hbm, fetch_vmem, wb_hbm, wb_vmem,
-    fetch_val).
-    - HEAD_ALONG_SUBLANE: 4 fields (fetch_hbm, fetch_vmem, dst_hbm, fetch_val).
+    Five, matching `schedule.SeqAlongLaneDmaNew`: fetch_hbm, fetch_vmem, wb_hbm,
+    wb_vmem, and the packed flags word.
     """
-    return 5 if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE else 4
+    return 5
 
   @property
   def fuse_accum(self) -> bool:
@@ -462,130 +451,51 @@ class MlaConfigs:
     )
 
   @property
+  def max_steps_needed(self) -> int:
+    """Upper bound on the schedule steps *any* input of this shape can need.
+
+    The schedule loop increments a counter once per (sequence, q-block, k-block)
+    task and packs `batch_size` consecutive tasks into one step, so bounding the
+    task count bounds the step count. Both factors below hold for every ragged
+    split of `total_q_tokens` across `num_seqs` sequences, which is what makes
+    this computable at trace time from shapes alone.
+
+    Nothing here can be tightened by looking at the actual `cu_q_lens` /
+    `kv_lens`, because those are runtime values; the bound has to cover the
+    worst split the shapes permit. It does assume `kv_len <= pages_per_seq *
+    page_size` for every sequence, but a `kv_len` past the end of its page table
+    is already an out-of-contract input that the kernel would read the wrong
+    pages for.
+    """
+    # Sequence `s` contributes `cdiv(q_len_s, bq_sz)` q-blocks. Two bounds on
+    # the sum are available and neither dominates: `cdiv(q, b) <= q` is tight
+    # for decode (many one-token sequences), `cdiv(q, b) <= q // b + 1` is tight
+    # for prefill (few long ones).
+    q_blocks_ub = min(
+        self.serve.total_q_tokens,
+        self.serve.num_seqs + self.serve.total_q_tokens // self.block.bq_sz,
+    )
+    # A q-block visits at most every KV block the page table can address for
+    # its sequence. Causal and sliding-window masking only remove blocks from
+    # that range, so ignoring both is safe (and, for prefill, loose by ~2x).
+    k_blocks_ub = pl.cdiv(
+        self.serve.pages_per_seq * self.serve.page_size, self.block.bkv_sz
+    )
+    return pl.cdiv(q_blocks_ub * k_blocks_ub, self.block.batch_size)
+
+  @property
   def max_schedule_size_multiplier(self) -> int:
-    return self.serve.max_schedule_size_multiplier
+    """Sizes the HBM schedule at `max_steps_ub *` this, in steps.
 
-  def validate_inputs(
-      self,
-      ql_nope: jax.Array,
-      q_pe: jax.Array,
-      new_kv_c: jax.Array,
-      new_k_pe: jax.Array,
-      cache_kv: jax.Array,
-      kv_lens: jax.Array,
-      page_indices: jax.Array,
-      cu_q_lens: jax.Array,
-      distribution: jax.Array,
-  ) -> None:
-    """Statically validates input shapes, dtypes, and layout constraints."""
-    if ql_nope.ndim != 3:
-      raise ValueError(
-          "Expected 3D array [total_tokens, num_heads, lkv_dim] for ql_nope,"
-          f" got {ql_nope.shape}"
-      )
-    if q_pe.ndim != 3:
-      raise ValueError(
-          "Expected 3D array [total_tokens, num_heads, r_dim] for q_pe, got"
-          f" {q_pe.shape}"
-      )
-    if new_kv_c.ndim != 2:
-      raise ValueError(
-          "Expected 2D array [total_tokens, lkv_dim] for new_kv_c, got"
-          f" {new_kv_c.shape}"
-      )
-    if new_k_pe.ndim != 2:
-      raise ValueError(
-          "Expected 2D array [total_tokens, r_dim] for new_k_pe, got"
-          f" {new_k_pe.shape}"
-      )
-
-    total_tokens_nope, num_heads_nope, lkv_dim = ql_nope.shape
-    total_tokens_pe, num_heads_pe, r_dim = q_pe.shape
-
-    if total_tokens_nope != total_tokens_pe:
-      raise ValueError(
-          f"Mismatched token count: {total_tokens_nope=} vs {total_tokens_pe=}"
-      )
-    if num_heads_nope != num_heads_pe:
-      raise ValueError(
-          f"Mismatched query heads: {num_heads_nope=} vs {num_heads_pe=}"
-      )
-    if (
-        new_kv_c.shape[0] != total_tokens_nope
-        or new_k_pe.shape[0] != total_tokens_nope
-    ):
-      raise ValueError(
-          f"Mismatched token count in new KV: {new_kv_c.shape[0]=},"
-          f" {new_k_pe.shape[0]=} vs {total_tokens_nope=}"
-      )
-    if new_kv_c.shape[1] != lkv_dim:
-      raise ValueError(
-          f"Mismatched latent KV dimension: {new_kv_c.shape[1]=} vs {lkv_dim=}"
-      )
-    if new_k_pe.shape[1] != r_dim:
-      raise ValueError(
-          f"Mismatched RoPE key dimension: {new_k_pe.shape[1]=} vs {r_dim=}"
-      )
-
-    if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
-      if self.serve.page_size % 128 != 0:
-        raise ValueError(
-            "page_size must be a multiple of 128 for SEQ_ALONG_LANE, got"
-            f" {self.serve.page_size=}"
-        )
-      expected_kv_shape = (
-          cache_kv.shape[0],
-          self.aligned_kv_dim // self.serve.packing_kv,
-          self.serve.packing_kv,
-          self.serve.page_size,
-      )
-    else:
-      expected_kv_shape = (
-          cache_kv.shape[0],
-          self.serve.page_size,
-          self.aligned_kv_dim // self.serve.packing_kv,
-          self.aligned_kv_dim,
-      )
-
-    if cache_kv.shape != expected_kv_shape:
-      raise ValueError(
-          f"Expected 4D KV cache shape {expected_kv_shape}, got {cache_kv.shape}"
-      )
-
-    if not jnp.issubdtype(cache_kv.dtype, jnp.floating):
-      raise ValueError(
-          f"Expected floating point KV cache, got {cache_kv.dtype}"
-      )
-    if not (cache_kv.dtype == new_kv_c.dtype == new_k_pe.dtype):
-      raise ValueError(
-          f"Mismatched dtypes: cache={cache_kv.dtype}, new_c={new_kv_c.dtype},"
-          f" new_pe={new_k_pe.dtype}"
-      )
-
-    if not (
-        jnp.int32
-        == kv_lens.dtype
-        == page_indices.dtype
-        == cu_q_lens.dtype
-        == distribution.dtype
-    ):
-      raise ValueError(
-          "Metadata arrays (kv_lens, page_indices, cu_q_lens, distribution)"
-          " must be int32."
-      )
-
-    max_num_seqs = kv_lens.shape[0]
-    if page_indices.shape[0] % max_num_seqs != 0:
-      raise ValueError(
-          f"page_indices size {page_indices.shape[0]} must be divisible by"
-          f" num_seqs {max_num_seqs}"
-      )
-    if cu_q_lens.shape != (max_num_seqs + 1,):
-      raise ValueError(
-          f"Expected cu_q_lens shape ({max_num_seqs + 1},), got"
-          f" {cu_q_lens.shape}"
-      )
-    if distribution.shape != (3,):
-      raise ValueError(
-          f"Expected distribution shape (3,), got {distribution.shape}"
-      )
+    Raised above the configured value whenever the shape provably needs more
+    room, which is what keeps the overflow guard in `_write_schedule_to_hbm`
+    from ever firing. Sizing is the fix rather than validation: the bound is a
+    worst-case over ragged splits, so rejecting shapes that merely *might*
+    overflow would reject shapes that in practice never do, whereas
+    over-allocating costs only HBM - a few hundred bytes per step, in a buffer
+    the kernel streams rather than resides in.
+    """
+    return max(
+        self.serve.max_schedule_size_multiplier,
+        pl.cdiv(self.max_steps_needed, self.max_steps_ub),
+    )
