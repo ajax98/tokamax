@@ -29,3 +29,26 @@ try:
   )
 except ImportError:
   pass
+
+try:
+  from tokamax._src.ops.experimental.mla import v2_op  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+
+  IMPLEMENTATIONS['v2'] = v2_op.V2MultiHeadLatentAttention()
+except ImportError:
+  pass
+
+try:
+  from tokamax._src.ops.experimental.mla import v3_op  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+
+  IMPLEMENTATIONS['v3'] = v3_op.V3MultiHeadLatentAttention()
+except ImportError:
+  pass
+
+try:
+  from tokamax._src.ops.experimental.mla import v3_native_op  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+
+  IMPLEMENTATIONS['v3_native'] = (
+      v3_native_op.V3NativeMultiHeadLatentAttention()
+  )
+except ImportError:
+  pass

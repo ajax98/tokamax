@@ -121,7 +121,8 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
     assert self.window_ref is not None
     vmem_dst_lane: Any = self.window_ref.at[slot]
     num_lanes = pltpu.get_tpu_info().num_lanes
-    lkv_sublanes = self.cfgs.aligned_lkv_dim // self.cfgs.serve.packing_kv
+    lkv_sublanes = self.cfgs.lkv_sublanes
+    hbm_sublanes = lkv_sublanes + self.cfgs.hbm_r_sublanes
 
     for b in range(self.cfgs.batch_size):
       # 1. Fetch cached paged tokens from 4D HBM cache
@@ -134,19 +135,34 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         dst_off = pl.multiple_of(dst_off, num_lanes)
         sz = pl.multiple_of(sz, num_lanes)
 
-        # 4D slice: kv_cache_hbm[:lkv_sublanes, :, :] -> vmem_dst_lane[:lkv_sublanes, :, :] (C_kv)
-        pltpu.make_async_copy(
-            kv_cache_hbm.at[hbm_p_idx, :lkv_sublanes, :, pl.ds(0, sz)],
-            vmem_dst_lane.at[b, :lkv_sublanes, :, pl.ds(dst_off, sz)],
-            sem,
-        ).start()
+        # The HBM cache may be narrower than the VMEM buffer: under
+        # `compact_kv_dim` its RoPE part is 16 sublanes rather than 32. Both
+        # sides are sliced to the HBM extent, leaving VMEM sublanes
+        # [lkv + hbm_r, aligned) untouched. Those are `q_pe` columns 64..127,
+        # which `prepare_q_inputs` zero-pads, so they contribute nothing to the
+        # QK-PE dot regardless of their contents.
+        if self.cfgs.serve.merge_kv_dma:
+          # C_kv [:lkv_sublanes] and K_pe [lkv_sublanes : lkv+r] are adjacent
+          # and share source and destination lane slices, so one copy is
+          # identical to the two below and halves the descriptor count. Byte
+          # totals are unchanged, so `total_wait_kv_in` still matches.
+          pltpu.make_async_copy(
+              kv_cache_hbm.at[hbm_p_idx, :hbm_sublanes, :, pl.ds(0, sz)],
+              vmem_dst_lane.at[b, :hbm_sublanes, :, pl.ds(dst_off, sz)],
+              sem,
+          ).start()
+        else:
+          pltpu.make_async_copy(
+              kv_cache_hbm.at[hbm_p_idx, :lkv_sublanes, :, pl.ds(0, sz)],
+              vmem_dst_lane.at[b, :lkv_sublanes, :, pl.ds(dst_off, sz)],
+              sem,
+          ).start()
 
-        # 4D slice: kv_cache_hbm[lkv_sublanes:, :, :] -> vmem_dst_lane[lkv_sublanes:, :, :] (K_pe)
-        pltpu.make_async_copy(
-            kv_cache_hbm.at[hbm_p_idx, lkv_sublanes:, :, pl.ds(0, sz)],
-            vmem_dst_lane.at[b, lkv_sublanes:, :, pl.ds(dst_off, sz)],
-            sem,
-        ).start()
+          pltpu.make_async_copy(
+              kv_cache_hbm.at[hbm_p_idx, lkv_sublanes:hbm_sublanes, :, pl.ds(0, sz)],
+              vmem_dst_lane.at[b, lkv_sublanes:hbm_sublanes, :, pl.ds(dst_off, sz)],
+              sem,
+          ).start()
 
       # 2. Fetch unpaged new KV tokens from HBM
       for i in range(self.cfgs.bkv_p_new):
@@ -166,10 +182,12 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
             sem,
         ).start()
 
-        # new_k_pe_hbm -> vmem_dst_lane[lkv_sublanes:, :, :] (K_pe)
+        # new_k_pe_hbm -> vmem_dst_lane[lkv_sublanes:hbm_sublanes, :, :] (K_pe).
+        # `new_k_pe` is prepared at the HBM width, so the destination stops
+        # there too.
         pltpu.make_async_copy(
             new_k_pe_hbm.at[:, :, pl.ds(src_new_off, sz)],
-            vmem_dst_lane.at[b, lkv_sublanes:, :, pl.ds(dst_vmem_off, sz)],
+            vmem_dst_lane.at[b, lkv_sublanes:hbm_sublanes, :, pl.ds(dst_vmem_off, sz)],
             sem,
         ).start()
 
@@ -188,7 +206,8 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
     assert self.window_ref is not None
     vmem_src_lane: Any = self.window_ref.at[slot]
     num_lanes = pltpu.get_tpu_info().num_lanes
-    lkv_sublanes = self.cfgs.aligned_lkv_dim // self.cfgs.serve.packing_kv
+    lkv_sublanes = self.cfgs.lkv_sublanes
+    hbm_sublanes = lkv_sublanes + self.cfgs.hbm_r_sublanes
 
     for b in range(self.cfgs.batch_size):
       do_writeback = schedule_ref.do_writeback[block_idx, b] == 1
@@ -202,18 +221,26 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         src_vmem_off = pl.multiple_of(src_vmem_off, num_lanes)
         sz = pl.multiple_of(sz, num_lanes)
 
-        # Write back concatenated into 4D kv_out_ref
-        pltpu.make_async_copy(
-            vmem_src_lane.at[b, :lkv_sublanes, :, pl.ds(src_vmem_off, sz)],
-            kv_out_ref.at[hbm_p_idx, :lkv_sublanes, :, pl.ds(0, sz)],
-            sem,
-        ).start()
+        # Write back concatenated into 4D kv_out_ref. Same adjacency argument
+        # as `copy_in`: one copy covers both halves.
+        if self.cfgs.serve.merge_kv_dma:
+          pltpu.make_async_copy(
+              vmem_src_lane.at[b, :hbm_sublanes, :, pl.ds(src_vmem_off, sz)],
+              kv_out_ref.at[hbm_p_idx, :hbm_sublanes, :, pl.ds(0, sz)],
+              sem,
+          ).start()
+        else:
+          pltpu.make_async_copy(
+              vmem_src_lane.at[b, :lkv_sublanes, :, pl.ds(src_vmem_off, sz)],
+              kv_out_ref.at[hbm_p_idx, :lkv_sublanes, :, pl.ds(0, sz)],
+              sem,
+          ).start()
 
-        pltpu.make_async_copy(
-            vmem_src_lane.at[b, lkv_sublanes:, :, pl.ds(src_vmem_off, sz)],
-            kv_out_ref.at[hbm_p_idx, lkv_sublanes:, :, pl.ds(0, sz)],
-            sem,
-        ).start()
+          pltpu.make_async_copy(
+              vmem_src_lane.at[b, lkv_sublanes:hbm_sublanes, :, pl.ds(src_vmem_off, sz)],
+              kv_out_ref.at[hbm_p_idx, lkv_sublanes:hbm_sublanes, :, pl.ds(0, sz)],
+              sem,
+          ).start()
 
   def wait_in(
       self,

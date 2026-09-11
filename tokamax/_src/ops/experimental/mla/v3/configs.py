@@ -148,6 +148,90 @@ class ServingConfigs:
   smem_fraction_limit_for_schedule_generation: float = 0.33
   max_schedule_size_multiplier: int = 16
 
+  # --- Inner-loop precision / scheduling knobs -----------------------------
+  #
+  # v3 originally had none of these; scores and softmax probabilities stayed
+  # f32 throughout and PV followed QK immediately. v2 has all three and its
+  # autotuner selected them on every workload measured, which made them the
+  # leading explanation for v3's ~1.6x kernel gap on decode_f8_kv9216.
+  #
+  # Defaults reproduce the original v3 behaviour exactly, so enabling them is
+  # opt-in and the existing correctness tests remain a valid baseline.
+  #
+  # s_dtype: dtype the QK scores are narrowed to before masking and the online
+  #   softmax. `None` keeps f32. bf16 is safe for the default mask value
+  #   (-0.7 * finfo(f32).max) because bf16 shares f32's 8 exponent bits, so the
+  #   sentinel is representable and does not become -inf.
+  # p_same_dtype_as_v: cast softmax probabilities to the KV dtype before the PV
+  #   matmul, so the MXU sees fp8 x fp8 rather than f32 x fp8. Operand width,
+  #   not accumulator width -- accumulation stays f32 either way.
+  # two_step_flash_attention: defer a query chunk's PV until after the next
+  #   chunk's QK, so VALU (softmax) overlaps MXU (previous PV). Only has an
+  #   effect when `q_split > 1`, i.e. `bq_c_sz < bq_sz`.
+  s_dtype: Any | None = None
+  p_same_dtype_as_v: bool = False
+  two_step_flash_attention: bool = False
+
+  # fast_mask: use the single-token mask fast path when a query block holds one
+  #   token (`bq_sz == 1`, i.e. all of DECODE). The general path computes
+  #   `broadcasted_iota(...) // num_q_heads` over the full [n_q, s_dim] score
+  #   tile; with one token per block that expression is identically zero, so
+  #   the divide and two of the three full-tile int32 materializations are pure
+  #   waste. Off by default so the original path stays the correctness
+  #   reference.
+  fast_mask: bool = False
+
+  # compact_kv_dim: pad the latent and RoPE parts of the KV dimension to a
+  #   whole number of *sublane groups* (packing_kv * 8) rather than to 128
+  #   lanes each.
+  #
+  #   v3 stores the KV dimension on sublanes (SEQ_ALONG_LANE), so 128-lane
+  #   alignment is the wrong requirement -- it is inherited from v2, whose
+  #   untransposed cache puts kv_dim on lanes and genuinely needs it. For
+  #   DeepSeek-V3 the difference is real: align_to(512,128) + align_to(64,128)
+  #   = 640, where the true sum is 576. At fp8 that is 144 sublanes, already a
+  #   multiple of 8, so 640 buys nothing and costs 10% of every byte of KV --
+  #   cache footprint, DMA per block, and layout conversion.
+  #
+  #   This is a v3-only saving: v2 cannot express it. Off by default because it
+  #   changes the cache shape, so it needs a matching arg-spec
+  #   (`cache_layout='v3_compact'`).
+  compact_kv_dim: bool = False
+
+  # tight_kv_slack: reserve one page of stitch slack instead of two when the
+  #   query block holds a single token. Provably sufficient for decode -- see
+  #   `MlaConfigs.kv_vmem_lanes` for the bound. Saves 20% of the KV staging
+  #   buffer at page_size=1024 and narrows the DMA destination stride.
+  tight_kv_slack: bool = False
+
+  # merge_kv_dma: issue one DMA per cache page instead of two. `copy_in` splits
+  #   each page into `[:lkv_sublanes]` and `[lkv_sublanes:]` with identical
+  #   source and destination lane slices; the ranges are adjacent and together
+  #   cover the full sublane extent, so one copy is identical and halves the
+  #   descriptor count. Byte totals are unchanged, so the schedule's
+  #   `total_wait_kv_in` still matches.
+  merge_kv_dma: bool = False
+
+  # disable_bounds_checks: v2 compiles with bounds checks off
+  #   (`v2/kernel.py:2635`); v3 leaves them on. With hundreds of DMA
+  #   descriptors per step that may not be free.
+  disable_bounds_checks: bool = False
+
+  # kv_slack_pad_lanes: extra lanes appended to the KV staging buffer purely to
+  #   change its *stride*, not its capacity.
+  #
+  #   `_stitch_decode_lane` and `store_new_kv_lane` walk the buffer with
+  #   `pl.ds(start, outer_dim, lanes_per_col)` where
+  #   `lanes_per_col = kv_vmem_lanes // 128`. That stride lands on VMEM banks,
+  #   and a power-of-two stride aliases every access onto the same bank.
+  #
+  #   Measured: shrinking the buffer 5120 -> 4096 lanes (stride 40 -> 32) made
+  #   the kernel 49% *slower* despite being strictly less work. 32 is a pure
+  #   power of two; 40 is 8x5 and advances through banks. Adding 128 lanes
+  #   makes `lanes_per_col` odd (4096+128 -> 33), which is coprime with any
+  #   power-of-two bank count and should spread best of all.
+  kv_slack_pad_lanes: int = 0
+
   @property
   def pages_per_seq(self) -> int:
     return self.num_page_indices // self.num_seqs
@@ -238,16 +322,67 @@ class MlaConfigs:
 
   # Derived hardware alignment dimensions
   @property
+  def kv_dim_align(self) -> int:
+    """Granularity the KV sub-dimensions are padded to in VMEM: 128 lanes.
+
+    This is the *compute* view and must stay lane-aligned. An earlier attempt
+    shrank it to `packing_kv * 8` under `compact_kv_dim`, which also shrank
+    `aligned_r_dim` -- and `q_pe` is reshaped with that as its **minor**
+    dimension. A TPU vector's minor dim is the lane axis, so Mosaic rejected
+    the result:
+
+        tpu.reshape : (vector<1x2x1x16x4x128xf8E4M3FN>) -> vector<2x128x64>
+        infer-vector-layout: unsupported shape cast
+
+    The saving is still available, but only on the HBM side: the *cache* keeps
+    kv_dim on sublanes, where a sublane group is the real requirement. That
+    needs an HBM-compact / VMEM-padded split, not a change here.
+    """
+    return utils.get_tpu_num_lanes()
+
+  @property
   def aligned_lkv_dim(self) -> int:
-    """d_nope (512) aligned to 128 physical TPU vector lanes."""
-    num_lanes = utils.get_tpu_num_lanes()
-    return utils.align_to(self.model.lkv_dim, num_lanes)
+    """d_nope (512), padded to 128 lanes."""
+    return utils.align_to(self.model.lkv_dim, self.kv_dim_align)
 
   @property
   def aligned_r_dim(self) -> int:
-    """d_pe (64) aligned to 128 physical TPU vector lanes (aligned to 128)."""
-    num_lanes = utils.get_tpu_num_lanes()
-    return utils.align_to(self.model.r_dim, num_lanes)
+    """d_pe (64 -> 128), padded to 128 lanes. See `kv_dim_align`."""
+    return utils.align_to(self.model.r_dim, self.kv_dim_align)
+
+  @property
+  def hbm_r_dim(self) -> int:
+    """d_pe as stored in the *HBM* cache.
+
+    Under `compact_kv_dim`, padded only to a sublane group
+    (`packing_kv * 8` = 32 at fp8) rather than to 128 lanes: 64 instead of 128
+    for DeepSeek-V3. Legal because the cache keeps kv_dim on **sublanes**,
+    where whole 32-bit words in groups of 8 is the requirement -- the 128-lane
+    rule applies to `q_pe`, which lives on lanes and is left alone (see
+    `kv_dim_align`).
+
+    This shrinks the cache and every KV DMA by 10% (640 -> 576) without
+    touching the VMEM staging buffer, so `mla_body`, `flash_attention` and the
+    stitch stride are all unaffected.
+    """
+    if self.serve.compact_kv_dim:
+      return utils.align_to(self.model.r_dim, self.serve.packing_kv * 8)
+    return self.aligned_r_dim
+
+  @property
+  def hbm_kv_dim(self) -> int:
+    """Total KV width in HBM: 576 compact, 640 otherwise."""
+    return self.aligned_lkv_dim + self.hbm_r_dim
+
+  @property
+  def hbm_r_sublanes(self) -> int:
+    """Sublanes the RoPE part occupies in HBM: 16 compact, 32 otherwise."""
+    return self.hbm_r_dim // self.serve.packing_kv
+
+  @property
+  def lkv_sublanes(self) -> int:
+    """Sublanes the latent part occupies. Same in HBM and VMEM."""
+    return self.aligned_lkv_dim // self.serve.packing_kv
 
   @property
   def aligned_kv_dim(self) -> int:
@@ -322,8 +457,15 @@ class MlaConfigs:
   # Per-token byte sizes for DMA lane wait synchronization
   @property
   def kv_bytes_per_token(self) -> int:
-    """Byte count transferred per KV token (1 shared latent stream)."""
-    return self.aligned_kv_dim * jnp.dtype(self.serve.dtype_kv).itemsize
+    """Byte count transferred per KV token (1 shared latent stream).
+
+    Must be the **HBM** width, not the VMEM width. `_compute_waits` turns this
+    into `total_wait_kv_in`, and `KVBufferedRefSeqAlongLane.wait_in` blocks
+    until that many bytes have landed. Under `compact_kv_dim` the DMA moves 576
+    bytes per token while VMEM is 640 wide -- using the latter here makes the
+    wait expect 11% more bytes than are ever sent, and the kernel deadlocks.
+    """
+    return self.hbm_kv_dim * jnp.dtype(self.serve.dtype_kv).itemsize
 
   @property
   def q_bytes_per_token(self) -> int:
@@ -398,14 +540,49 @@ class MlaConfigs:
     )
 
   @property
+  def kv_vmem_lanes(self) -> int:
+    """Lane extent of the KV staging buffer: `bkv_sz` plus stitch slack.
+
+    The slack holds new-KV pages fetched *past* the cached region before
+    `stitch_*_lane` rolls them into place. `fill_dma_kv_new` writes
+    `page_size` bytes at `fetch_vmem = (cache_pages + i) * page_size`, so the
+    buffer must cover `(cache_pages + i + 1) * page_size`. Two pages in
+    general: one for rounding `bkv_sz_cache` up to a page, one for the new
+    tokens' own intra-page offset.
+
+    **Decode needs only one.** With `q_len == 1`,
+    `new_sz = min(bkv_sz - bkv_sz_cache, kv_left_frm_new) <= 1` token, so
+    `num_pages_to_fetch == 1` and only `i = 0` runs -- which the `bq_sz == 1`
+    branch in `schedule.fill_dma_kv_new` already asserts via
+    `bkv_p_new == 1`. Then `fetch_vmem = cache_pages * page_size <= bkv_sz`
+    and the write extends one page: `bkv_sz + page_size` suffices, and the
+    second page is never touched.
+
+    Reserving it anyway costs 20% of the buffer at page_size=1024 and widens
+    the DMA destination stride (5120 vs 4096 lanes for a 1024-byte write),
+    which is why this is worth a flag rather than left as a constant.
+
+    The guard mirrors the condition `stitch_new_kv_lane` uses to select its
+    O(1) path, so it cannot apply to a multi-token query block.
+    """
+    tight = self.serve.tight_kv_slack and (
+        self.mode == MlaCase.DECODE or self.block.bq_sz == 1
+    )
+    return (
+        self.block.bkv_sz
+        + (1 if tight else 2) * self.serve.page_size
+        + self.serve.kv_slack_pad_lanes
+    )
+
+  @property
   def kv_vmem_shape(self) -> tuple[int, ...]:
-    """VMEM allocation shape for KV buffer [batch_size, sublanes, packing, bkv_sz + 2 * page_size]."""
+    """VMEM allocation shape for KV buffer [batch_size, sublanes, packing, lanes]."""
     num_sublanes = self.aligned_kv_dim // self.serve.packing_kv
     return (
         self.block.batch_size,
         num_sublanes,
         self.serve.packing_kv,
-        self.block.bkv_sz + 2 * self.serve.page_size,
+        self.kv_vmem_lanes,
     )
 
   @property

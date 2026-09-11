@@ -116,22 +116,68 @@ def flash_attention_qk_softmax(
   if cfgs.model.soft_cap is not None:
     s = cfgs.model.soft_cap * jnp.tanh(s / cfgs.model.soft_cap)
 
+  # 2b. Optionally narrow the score tile before masking and softmax.
+  #
+  # `s` is [B, H_q * T_q, S] -- the widest intermediate in the kernel -- and
+  # everything downstream of here (the mask `jnp.where`, the row max, the
+  # `exp`, the row sum) is vector work over it. Narrowing to bf16 halves that
+  # VREG traffic. This mirrors `v2/kernel.py:661`, which casts to `s_dtype`
+  # (bf16 by default) at exactly this point.
+  #
+  # Note the QK dot above already accumulated in f32, and `p` below comes back
+  # out as f32 because `m` is f32; the saving is in the vector ops, not the
+  # matmul.
+  if (s_dtype := cfgs.serve.s_dtype) is not None:
+    s = s.astype(s_dtype)
+
   # 3. Causal & Sliding-Window Masking
   if processed_q_len is not None and processed_kv_len is not None:
-    q_iota = lax.broadcasted_iota(jnp.int32, (n_q, s_dim), 0) // num_q_heads
-    kv_iota = lax.broadcasted_iota(jnp.int32, (n_q, s_dim), 1)
-    q_kv_diff = q_iota - kv_iota
+    sliding_window = cfgs.model.sliding_window
+    n_tokens = n_q // num_q_heads
 
-    s_masked = []
-    for b_idx in range(b):
-      offset = processed_kv_len[b_idx] - (bq_start + processed_q_len[b_idx])
-      mask_b = q_kv_diff >= offset
+    if cfgs.serve.fast_mask and n_tokens == 1:
+      # Single-token fast path (decode, and any bq_sz==1 block).
+      #
+      # Rows are laid out `token * aligned_num_q_heads + head`, so
+      # `row // num_q_heads` is the token index -- and with one token per block
+      # it is identically 0. The general path below therefore materializes a
+      # full [n_q, s_dim] iota and runs an int32 *divide* over it, every step,
+      # to produce a tile of zeros. At the decode optimum that tile is
+      # [128, 2048]: ~1 MB, three times over (two iotas and their difference),
+      # plus the divide.
+      #
+      # With q_iota == 0 the predicate collapses to a 1-D comparison against
+      # the KV lane index:
+      #     q_iota - kv_iota >= offset   <=>   kv_iota <= -offset
+      # so a [1, s_dim] iota broadcast over rows is sufficient. No divide, no
+      # 2-D query iota, no full-tile subtract.
+      kv_iota_1d = lax.broadcasted_iota(jnp.int32, (1, s_dim), 1)
+      s_masked = []
+      for b_idx in range(b):
+        offset = processed_kv_len[b_idx] - (bq_start + processed_q_len[b_idx])
+        mask_b = kv_iota_1d <= -offset
+        if sliding_window is not None:
+          # -kv_iota < sliding_window + offset  <=>  kv_iota > -offset - sw
+          mask_b = jnp.logical_and(
+              mask_b, kv_iota_1d > -offset - sliding_window
+          )
+        s_masked.append(jnp.where(mask_b, s[b_idx], cfgs.model.mask_value))
+      s = jnp.stack(s_masked, axis=0)
+    else:
+      q_iota = lax.broadcasted_iota(jnp.int32, (n_q, s_dim), 0) // num_q_heads
+      kv_iota = lax.broadcasted_iota(jnp.int32, (n_q, s_dim), 1)
+      q_kv_diff = q_iota - kv_iota
 
-      if (sliding_window := cfgs.model.sliding_window) is not None:
-        mask_b = jnp.logical_and(mask_b, q_kv_diff < sliding_window + offset)
+      s_masked = []
+      for b_idx in range(b):
+        offset = processed_kv_len[b_idx] - (bq_start + processed_q_len[b_idx])
+        mask_b = q_kv_diff >= offset
 
-      s_masked.append(jnp.where(mask_b, s[b_idx], cfgs.model.mask_value))
-    s = jnp.stack(s_masked, axis=0)
+        if sliding_window is not None:
+          mask_b = jnp.logical_and(mask_b, q_kv_diff < sliding_window + offset)
+
+        s_masked.append(jnp.where(mask_b, s[b_idx], cfgs.model.mask_value))
+      s = jnp.stack(s_masked, axis=0)
 
   # 4. Online Softmax Running Statistics
   s_curr_max = jnp.max(s, axis=-1, keepdims=True)
@@ -191,6 +237,18 @@ def flash_attention_pv(
     Updated unnormalized output accumulator [B, H_q * T_q, d_nope].
   """
   b = p.shape[0]
+
+  # Narrow the PV *operand*, not the accumulator.
+  #
+  # `preferred_element_type=jnp.float32` below sets the accumulation width and
+  # is unchanged; what this cast changes is what the MXU is fed. Without it
+  # `p` arrives as f32 (out of `jnp.exp`) and `v` is the KV dtype, so the dot
+  # runs at the wider operand's rate. v2 does the same thing at
+  # `v2/kernel.py:733` under `p_same_dtype_as_v`, which its autotuner selected
+  # on every workload measured. At FP8 the gap between fp8 x fp8 and f32 x fp8
+  # is large, and PV is roughly half the kernel's FLOPs.
+  if cfgs.serve.p_same_dtype_as_v:
+    p = p.astype(v.dtype)
 
   pv = lax.dot(
       p,
@@ -280,6 +338,23 @@ def chunked_flash_attention(
   l_next_splits = []
   o_next_splits = []
 
+  # With `two_step_flash_attention`, a chunk's PV is deferred until after the
+  # *next* chunk's QK+softmax has been issued, so the MXU work of the former
+  # overlaps the VALU work of the latter. Without it, each chunk runs QK then
+  # PV back-to-back and the two units idle in turn.
+  #
+  # This mirrors `v2/kernel.py:1986-2026`, which keeps `prev_p`/`prev_v` across
+  # loop iterations and flushes the final PV after the loop. Note it only bites
+  # when `q_split > 1` -- with a single chunk there is no next QK to hide
+  # behind, which is the case for DECODE (`bq_sz = 1`).
+  pending = None  # (p, alpha, o_prev, slot)
+
+  def _flush(pending):
+    p_chunk, alpha_chunk, o_prev_chunk, slot = pending
+    o_next_splits[slot] = flash_attention_pv(
+        p_chunk, k_nope, alpha_chunk, o_prev_chunk, cfgs=cfgs
+    )
+
   for q_idx in range(q_split):
     start = q_idx * q_chunk_len
     end = start + q_chunk_len
@@ -306,13 +381,26 @@ def chunked_flash_attention(
             bq_start=bq_start,
         )
     )
-    o_next_chunk = flash_attention_pv(
-        p_chunk, k_nope, alpha_chunk, o_prev_chunk, cfgs=cfgs
-    )
+
+    if cfgs.serve.two_step_flash_attention:
+      # Retire the previous chunk's PV now that this chunk's QK is in flight.
+      if pending is not None:
+        _flush(pending)
+      o_next_splits.append(None)  # placeholder, filled by `_flush`
+      pending = (p_chunk, alpha_chunk, o_prev_chunk, q_idx)
+    else:
+      o_next_splits.append(
+          flash_attention_pv(
+              p_chunk, k_nope, alpha_chunk, o_prev_chunk, cfgs=cfgs
+          )
+      )
 
     m_carry_splits.append(m_carry_chunk)
     l_next_splits.append(l_next_chunk)
-    o_next_splits.append(o_next_chunk)
+
+  if pending is not None:
+    _flush(pending)
+  assert all(o is not None for o in o_next_splits)
 
   return (
       # `m_carry` chunks tile the query axis (axis 0); `l`/`o` chunks tile the

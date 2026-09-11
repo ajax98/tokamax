@@ -88,6 +88,15 @@ def mla_ragged_paged_attention(
     decode_block_sizes: configs.BlockSizes | None = None,
     prefill_block_sizes: configs.BlockSizes | None = None,
     vmem_limit_bytes: int | None = None,
+    s_dtype=None,
+    p_same_dtype_as_v: bool = False,
+    two_step_flash_attention: bool = False,
+    fast_mask: bool = False,
+    compact_kv_dim: bool = False,
+    tight_kv_slack: bool = False,
+    merge_kv_dma: bool = False,
+    disable_bounds_checks: bool = False,
+    kv_slack_pad_lanes: int = 0,
     debug_mode: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
   """MLA Ragged paged attention, orchestrated as Decode -> Prefill -> Mixed."""
@@ -125,6 +134,15 @@ def mla_ragged_paged_attention(
       scale_k=k_scale,
       scale_v=v_scale,
       kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+      s_dtype=s_dtype,
+      p_same_dtype_as_v=p_same_dtype_as_v,
+      two_step_flash_attention=two_step_flash_attention,
+      fast_mask=fast_mask,
+      compact_kv_dim=compact_kv_dim,
+      tight_kv_slack=tight_kv_slack,
+      merge_kv_dma=merge_kv_dma,
+      disable_bounds_checks=disable_bounds_checks,
+      kv_slack_pad_lanes=kv_slack_pad_lanes,
   )
 
   default_decode, default_prefill = calculate_block_sizes(
@@ -159,14 +177,25 @@ def mla_ragged_paged_attention(
       ql_nope,
       vmem_limit_bytes=vmem_limit_bytes,
   )
-  q_pe_prep = kernel.prepare_q_inputs(q_pe)
+  # All three stay at 128-lane alignment. `q_pe` in particular *must*: it is
+  # reshaped with `aligned_r_dim` as its minor dimension, which is the lane
+  # axis. See `MlaConfigs.kv_dim_align`.
+  head_align = init_cfgs.kv_dim_align
+  q_pe_prep = kernel.prepare_q_inputs(q_pe, head_align=head_align)
   new_kv_c_prep = kernel.prepare_kv_inputs_for_transposed_kv_cache(
       new_kv_c,
       page_size=page_size,
+      head_align=head_align,
   )
+  # `new_k_pe` is KV, so it follows the *HBM* width and shrinks with
+  # `compact_kv_dim`. `q_pe` above must not: it is reshaped with its head
+  # dimension as the minor (lane) axis.
   new_k_pe_prep = kernel.prepare_kv_inputs_for_transposed_kv_cache(
       new_k_pe,
       page_size=page_size,
+      head_align=(
+          init_cfgs.serve.packing_kv * 8 if compact_kv_dim else head_align
+      ),
   )
 
   def run_mla_kernel(

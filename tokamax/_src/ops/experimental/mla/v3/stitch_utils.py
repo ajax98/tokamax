@@ -113,7 +113,7 @@ def store_new_kv_lane(
     cfgs: configs.MlaConfigs,
 ):
   """Stores the result of stitch_new_kv_lane back into memory."""
-  v_len = cfgs.bkv_sz + 2 * cfgs.serve.page_size
+  v_len = cfgs.kv_vmem_lanes
   vmem_u32_ref = vmem_ref.at[b_idx].bitcast(jnp.uint32)
 
   if cfgs.block.bq_sz == 1:
@@ -155,13 +155,13 @@ def stitch_new_kv_lane(
 ):
   """Fetches and computes stitched KV tokens (separated to avoid RAW hazards).
 
-  Expects vmem_ref shape: [batch, sublanes, packing, bkv_sz + 2 * page_size]
+  Expects vmem_ref shape: [batch, sublanes, packing, cfgs.kv_vmem_lanes]
   """
   bkv_sz_cache = bkv_sz_frm_cache.astype(jnp.int32)
   new_tok_offset = new_kv_len_start.astype(jnp.int32) % cfgs.serve.page_size
   cache_pages = pl.cdiv(bkv_sz_cache, cfgs.serve.page_size)
 
-  v_len = cfgs.bkv_sz + 2 * cfgs.serve.page_size
+  v_len = cfgs.kv_vmem_lanes
   vmem_u32_ref = vmem_ref.at[b_idx].bitcast(jnp.uint32)
 
   if cfgs.block.bq_sz == 1:

@@ -43,6 +43,8 @@ def _make_mla_spec(
     q_dtype: jax.typing.DTypeLike,
     kv_dtype: jax.typing.DTypeLike,
     num_pages: int,
+    tags: Sequence[arg_spec.Tag] = ('primary', 'forward_only', 'ci_tests'),
+    cache_layout: str = 'v2',
 ) -> arg_spec.ArgSpec:
   """Generates an argument specification for MLA."""
   padded_r_dim = utils.align_to(r_dim, 128)
@@ -81,9 +83,30 @@ def _make_mla_spec(
   q_pe = jax.ShapeDtypeStruct((total_q_len, num_heads, r_dim), q_dtype)
   new_kv_c = jax.ShapeDtypeStruct((total_q_len, lkv_dim), kv_dtype)
   new_k_pe = jax.ShapeDtypeStruct((total_q_len, r_dim), kv_dtype)
-  cache_kv = jax.ShapeDtypeStruct(
-      (total_num_pages, page_size // packing, packing, padded_kv_dim), kv_dtype
-  )
+  if cache_layout == 'v2':
+    # Tokens on sublanes: [pages, page_size // P, P, kv_dim].
+    cache_shape = (total_num_pages, page_size // packing, packing, padded_kv_dim)
+  elif cache_layout == 'v3_compact':
+    # As 'v3', but without the wasted lane-alignment padding. v3 stores kv_dim
+    # on sublanes, so each part only needs a whole sublane group: 512 + 64 =
+    # 576 rather than align_to(512,128) + align_to(64,128) = 640. At fp8 that
+    # is 144 sublanes (a multiple of 8), so it is a legal layout and 10%
+    # smaller. Pairs with `Config(compact_kv_dim=True)`.
+    compact_kv_dim = utils.align_to(lkv_dim, packing * 8) + utils.align_to(
+        r_dim, packing * 8
+    )
+    cache_shape = (total_num_pages, compact_kv_dim // packing, packing,
+                   page_size)
+  elif cache_layout == 'v3':
+    # SEQ_ALONG_LANE -- tokens on lanes, latent dim on sublanes:
+    # [pages, aligned_kv_dim // P, P, page_size]. Same bytes, transposed.
+    # A v3-layout cache is what `v3_native` consumes; feeding it the v2 shape
+    # would make `static_validate_inputs` compute kv_dim = 64*4 = 256 and reject
+    # it against lkv_dim + r_dim = 640.
+    cache_shape = (total_num_pages, padded_kv_dim // packing, packing, page_size)
+  else:
+    raise ValueError(f'unknown {cache_layout=}')
+  cache_kv = jax.ShapeDtypeStruct(cache_shape, kv_dtype)
 
   kv_lens = HashableNPArray(np.array(kv_lens_list, dtype=np.int32))
   page_indices = HashableNPArray(np.array(page_indices_list, dtype=np.int32))
@@ -104,7 +127,7 @@ def _make_mla_spec(
       ),
       project='deepseek_v3',
       name=name,
-      tags=('primary', 'forward_only', 'ci_tests'),
+      tags=tuple(tags),
   )
 
 
@@ -141,5 +164,169 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         q_dtype=jnp.float8_e4m3fn,
         kv_dtype=jnp.float8_e4m3fn,
         num_pages=128,
+    ),
+    # ------------------------------------------------------------------------
+    # MLA v2-vs-v3 comparison specs.
+    #
+    # Derived from the production DeepSeek-V3 sweep at page_size=256. The sweep
+    # lists six entries at that page size, but they collapse to these three
+    # distinct workloads -- the other three differ only in
+    # `num_queries_per_block`, which is a tuning `Config` value, not part of the
+    # workload.
+    #
+    # FP8 throughout (queries, new KV updates and the paged cache), mirroring
+    # DeepSeek-V3 / Kimi FP8 KV-cache inference on TPU. `kv_dtype` also sets
+    # `packing = 4`, so `cache_kv` is `[pages, page_size // 4, 4, 640]`.
+    #
+    # Tagged `primary` (required -- `benchmarks/mla.py` filters on it) but not
+    # `ci_tests`: these are heavy shapes, and `decode_f8_kv9216` alone allocates
+    # ~755 MB of KV cache. `ci_tests` is inert for MLA in any case; only
+    # ragged_dot, attention and normalization consume it.
+    #
+    # Known gap: `_make_mla_spec` derives `distribution` as `[n, n, total]`, so
+    # the PREFILL band is empty by construction and the two prefill shapes below
+    # route through MIXED. Closing that needs a change to the builder.
+    # ------------------------------------------------------------------------
+    _make_mla_spec(
+        # Chunked prefill with 7936 tokens of history already in the paged
+        # cache. The highest-value spec for v2-vs-v3: nothing in the original
+        # set has `kv_len > q_len`, so v3's `bkv_p_cache` path -- whose
+        # docstring records that PREFILL used to skip the cache fetch entirely
+        # -- is otherwise never exercised. Longest KV walk here, so also the
+        # most likely to push v3's schedule past `max_steps_ub`.
+        name='chunked_prefill_f8_kv8192',
+        seq_lens=[(256, 8192)],
+        num_heads=128,
+        lkv_dim=512,
+        r_dim=64,
+        page_size=256,
+        q_dtype=jnp.float8_e4m3fn,
+        kv_dtype=jnp.float8_e4m3fn,
+        num_pages=128,
+        tags=('primary', 'forward_only'),
+    ),
+    _make_mla_spec(
+        # Pure decode at production batch size. Overlaps `decode_f8` above, but
+        # at kv_len=9216 -- exactly 36 pages -- so the single new token lands at
+        # offset 255, the last lane of its page. Edge case for both kernels'
+        # KV stitch logic.
+        name='decode_f8_kv9216',
+        seq_lens=[(1, 9216)] * 128,
+        num_heads=128,
+        lkv_dim=512,
+        r_dim=64,
+        page_size=256,
+        q_dtype=jnp.float8_e4m3fn,
+        kv_dtype=jnp.float8_e4m3fn,
+        num_pages=128,
+        tags=('primary', 'forward_only'),
+    ),
+    _make_mla_spec(
+        # Same shape as `chunked_prefill_f8_kv8192` with 768 rather than 7936
+        # tokens of history. Weak alone; the point is the contrast pair, which
+        # isolates how cost scales with cached history at fixed `q_len`.
+        name='chunked_prefill_f8_kv1024',
+        seq_lens=[(256, 1024)],
+        num_heads=128,
+        lkv_dim=512,
+        r_dim=64,
+        page_size=256,
+        q_dtype=jnp.float8_e4m3fn,
+        kv_dtype=jnp.float8_e4m3fn,
+        num_pages=128,
+        tags=('primary', 'forward_only'),
+    ),
+    # ---- page_size=1024 pair -------------------------------------------
+    # Same workload as decode_f8_kv9216, at the page size the production DS-V3
+    # sweep actually uses for decode.
+    #
+    # Motivation: v3's SEQ_ALONG_LANE cache has `page_size` as its *minor*
+    # dimension, so one contiguous HBM run is one page of tokens for a single
+    # (sublane, packing) channel -- 256 bytes at page_size=256, against v2's
+    # 640-byte runs (v2's minor dim is kv_dim). Decode is bandwidth-bound
+    # (v2 1.46 TB/s vs v3 0.96 TB/s moving identical bytes), so run length may
+    # be the whole gap. At page_size=1024 v3's runs become 1024 B -- larger
+    # than v2's 640 -- which should flip the advantage.
+    #
+    # Both caches are still 755 MB; only the run length differs.
+    _make_mla_spec(
+        name='decode_f8_kv9216_p1024',
+        seq_lens=[(1, 9216)] * 128,
+        num_heads=128,
+        lkv_dim=512,
+        r_dim=64,
+        page_size=1024,
+        q_dtype=jnp.float8_e4m3fn,
+        kv_dtype=jnp.float8_e4m3fn,
+        num_pages=128,
+        tags=('primary', 'forward_only'),
+    ),
+    _make_mla_spec(
+        # page_size=1024 with the compact 576-wide KV cache: (1152, 144, 4,
+        # 1024) = 679.5 MB against 755.0 MB. Pairs with
+        # `Config(compact_kv_dim=True)`.
+        name='decode_f8_kv9216_p1024_v3compact',
+        seq_lens=[(1, 9216)] * 128,
+        num_heads=128,
+        lkv_dim=512,
+        r_dim=64,
+        page_size=1024,
+        q_dtype=jnp.float8_e4m3fn,
+        kv_dtype=jnp.float8_e4m3fn,
+        num_pages=128,
+        tags=('primary', 'forward_only'),
+        cache_layout='v3_compact',
+    ),
+    _make_mla_spec(
+        name='decode_f8_kv9216_p1024_v3layout',
+        seq_lens=[(1, 9216)] * 128,
+        num_heads=128,
+        lkv_dim=512,
+        r_dim=64,
+        page_size=1024,
+        q_dtype=jnp.float8_e4m3fn,
+        kv_dtype=jnp.float8_e4m3fn,
+        num_pages=128,
+        tags=('primary', 'forward_only'),
+        cache_layout='v3',
+    ),
+    _make_mla_spec(
+        # As `decode_f8_kv9216_v3layout`, but with the KV dimension padded to
+        # sublane granularity instead of lane granularity: 576 rather than 640,
+        # giving a (4608, 144, 4, 256) cache. 10% less KV in HBM and 10% less
+        # DMA per block. Pairs with `Config(compact_kv_dim=True)`.
+        name='decode_f8_kv9216_v3compact',
+        seq_lens=[(1, 9216)] * 128,
+        num_heads=128,
+        lkv_dim=512,
+        r_dim=64,
+        page_size=256,
+        q_dtype=jnp.float8_e4m3fn,
+        kv_dtype=jnp.float8_e4m3fn,
+        num_pages=128,
+        tags=('primary', 'forward_only'),
+        cache_layout='v3_compact',
+    ),
+    _make_mla_spec(
+        # Byte-for-byte the same workload as `decode_f8_kv9216`, with the KV
+        # cache already in v3's SEQ_ALONG_LANE layout: (4608, 160, 4, 256)
+        # rather than (4608, 64, 4, 640).
+        #
+        # Exists for `v3_native`, which skips the per-call layout conversion.
+        # That conversion is ~86% of v3's measured decode time on the standard
+        # spec, and a deployed system holding the cache in v3 layout would never
+        # pay it -- so this spec measures steady state, while `decode_f8_kv9216`
+        # measures drop-in migration cost. Both are worth reporting.
+        name='decode_f8_kv9216_v3layout',
+        seq_lens=[(1, 9216)] * 128,
+        num_heads=128,
+        lkv_dim=512,
+        r_dim=64,
+        page_size=256,
+        q_dtype=jnp.float8_e4m3fn,
+        kv_dtype=jnp.float8_e4m3fn,
+        num_pages=128,
+        tags=('primary', 'forward_only'),
+        cache_layout='v3',
     ),
 )

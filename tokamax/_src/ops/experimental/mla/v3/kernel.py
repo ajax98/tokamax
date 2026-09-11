@@ -90,8 +90,11 @@ def static_validate_inputs(
 
   actual_lkv_dim = ql_nope.shape[-1]
   actual_r_dim = q_pe.shape[-1]
-  lkv_dim = utils.align_to(actual_lkv_dim, 128)
-  r_dim = utils.align_to(actual_r_dim, 128)
+  # Must mirror `MlaConfigs.kv_dim_align`; under `compact_kv_dim` the parts are
+  # padded to a sublane group rather than a full lane row.
+  align = cfgs.kv_dim_align
+  lkv_dim = utils.align_to(actual_lkv_dim, align)
+  r_dim = utils.align_to(actual_r_dim, align)
 
   if cache_kv.ndim != 4:
     raise ValueError(
@@ -113,10 +116,14 @@ def static_validate_inputs(
     raise ValueError(f"Expected {page_size=} to be a multiple of 128.")
 
   kv_dim = kv_sublanes * kv_packing
-  aligned_kv_dim = utils.align_to(kv_dim, 128)
-  if lkv_dim + r_dim != aligned_kv_dim:
+  # Compare against the *HBM* width: `compact_kv_dim` narrows the cache's RoPE
+  # part to a sublane group while VMEM and `q_pe` stay 128-lane aligned.
+  if kv_dim != cfgs.hbm_kv_dim:
     raise ValueError(
-        f"Expected {lkv_dim=} + {r_dim=} to be equal to {aligned_kv_dim=}"
+        f"cache_kv {kv_dim=} (from {kv_sublanes=} * {kv_packing=}) does not"
+        f" match {cfgs.hbm_kv_dim=}"
+        f" (= aligned_lkv_dim {cfgs.aligned_lkv_dim} + hbm_r_dim"
+        f" {cfgs.hbm_r_dim}; compact_kv_dim={cfgs.serve.compact_kv_dim})"
     )
 
   if not (cache_kv.dtype == new_kv_c.dtype):
@@ -193,11 +200,22 @@ def static_validate_inputs(
 
 def prepare_q_inputs(
     q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim],
+    head_align: int = 128,
 ) -> jax.Array:
+  # `head_align` must match `MlaConfigs.kv_dim_align` for q_pe: the QK-PE dot
+  # contracts q_pe against k_pe over this dimension, so the two must agree.
   max_num_tokens, actual_num_q_heads, actual_head_dim = q.shape
   packing_q = utils.get_dtype_packing(q.dtype)
   num_q_heads = utils.align_to(actual_num_q_heads, packing_q)
-  head_dim = utils.align_to(actual_head_dim, 128)
+  head_dim = utils.align_to(actual_head_dim, head_align)
+  # The reshape below folds heads and head_dim together into
+  # `words x packing x 128`, so head_dim need not be 128 itself -- but the
+  # product must still tile exactly.
+  if (num_q_heads * head_dim) % (128 * packing_q) != 0:
+    raise ValueError(
+        f"{num_q_heads=} * {head_dim=} must be a multiple of"
+        f" {128 * packing_q=} to reshape into lane-width words."
+    )
   q = jnp.pad(
       q,
       (
@@ -245,6 +263,7 @@ def prepare_kv_inputs_for_transposed_kv_cache(
     kv: jax.Array,
     page_size: int = 128,
     kv_packing: int | None = None,
+    head_align: int = 128,
 ) -> jax.Array:
   """Pads and transposes new KV inputs to [sublanes, kv_packing, max_num_tokens]."""
   max_num_tokens, actual_head_dim = kv.shape
@@ -256,7 +275,7 @@ def prepare_kv_inputs_for_transposed_kv_cache(
     pad = pad_multiple - (max_num_tokens % pad_multiple)
     kv = jnp.pad(kv, ((0, pad), (0, 0)), constant_values=0)
 
-  aligned_head_dim = utils.align_to(actual_head_dim, 128)
+  aligned_head_dim = utils.align_to(actual_head_dim, head_align)
   if aligned_head_dim != actual_head_dim:
     pad = aligned_head_dim - actual_head_dim
     kv = jnp.pad(kv, ((0, 0), (0, pad)), constant_values=0)
@@ -710,7 +729,7 @@ def _mla_ragged_paged_attention_kernel(
       ),
       compiler_params=pltpu.CompilerParams(
           vmem_limit_bytes=cfgs.vmem_limit_bytes,
-          disable_bounds_checks=False,
+          disable_bounds_checks=cfgs.serve.disable_bounds_checks,
       ),
       input_output_aliases={ql_nope_hbm_idx: 0, cache_kv_hbm_idx: 1},
       name=get_kernel_name(cfgs),
