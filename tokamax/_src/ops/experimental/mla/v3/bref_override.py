@@ -121,7 +121,8 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
     assert self.window_ref is not None
     vmem_dst_lane: Any = self.window_ref.at[slot]
     num_lanes = pltpu.get_tpu_info().num_lanes
-    lkv_sublanes = self.cfgs.aligned_lkv_dim // self.cfgs.serve.packing_kv
+    lkv_sublanes = self.cfgs.lkv_sublanes
+    hbm_sublanes = lkv_sublanes + self.cfgs.hbm_r_sublanes
 
     for b in range(self.cfgs.batch_size):
       # 1. Fetch cached paged tokens from 4D HBM cache
@@ -134,20 +135,21 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         dst_off = pl.multiple_of(dst_off, num_lanes)
         sz = pl.multiple_of(sz, num_lanes)
 
-        # 4D slice: kv_cache_hbm[:lkv_sublanes, :, :] -> vmem_dst_lane[:lkv_sublanes, :, :] (C_kv)
+        # The HBM cache may be narrower than the VMEM buffer: under
+        # a compact cache its RoPE part is 16 sublanes rather than 32. Both
+        # sides are sliced to the HBM extent, leaving VMEM sublanes
+        # [lkv + hbm_r, aligned) untouched. Those are `q_pe` columns 64..127,
+        # which `prepare_q_inputs` zero-pads, so they contribute nothing to the
+        # QK-PE dot regardless of their contents.
+        # C_kv [:lkv_sublanes] and K_pe [lkv_sublanes : lkv+r] are adjacent
+        # and share source and destination lane slices, so one copy is
+        # identical to the two below and halves the descriptor count. Byte
+        # totals are unchanged, so `total_wait_kv_in` still matches.
         pltpu.make_async_copy(
-            kv_cache_hbm.at[hbm_p_idx, :lkv_sublanes, :, pl.ds(0, sz)],
-            vmem_dst_lane.at[b, :lkv_sublanes, :, pl.ds(dst_off, sz)],
+            kv_cache_hbm.at[hbm_p_idx, :hbm_sublanes, :, pl.ds(0, sz)],
+            vmem_dst_lane.at[b, :hbm_sublanes, :, pl.ds(dst_off, sz)],
             sem,
         ).start()
-
-        # 4D slice: kv_cache_hbm[lkv_sublanes:, :, :] -> vmem_dst_lane[lkv_sublanes:, :, :] (K_pe)
-        pltpu.make_async_copy(
-            kv_cache_hbm.at[hbm_p_idx, lkv_sublanes:, :, pl.ds(0, sz)],
-            vmem_dst_lane.at[b, lkv_sublanes:, :, pl.ds(dst_off, sz)],
-            sem,
-        ).start()
-
       # 2. Fetch unpaged new KV tokens from HBM
       for i in range(self.cfgs.bkv_p_new):
         dma_entry = schedule_ref.dma_kv_new[block_idx, b, i]
@@ -159,19 +161,28 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         dst_vmem_off = pl.multiple_of(dst_vmem_off, num_lanes)
         sz = pl.multiple_of(sz, num_lanes)
 
-        # new_kv_c_hbm -> vmem_dst_lane[:lkv_sublanes, :, :] (C_kv)
-        pltpu.make_async_copy(
-            new_kv_c_hbm.at[:, :, pl.ds(src_new_off, sz)],
-            vmem_dst_lane.at[b, :lkv_sublanes, :, pl.ds(dst_vmem_off, sz)],
-            sem,
-        ).start()
+        def _start_new_kv(
+            src_new_off=src_new_off, dst_vmem_off=dst_vmem_off, sz=sz, b=b
+        ):
+          # new_kv_c_hbm -> vmem_dst_lane[:lkv_sublanes, :, :] (C_kv)
+          pltpu.make_async_copy(
+              new_kv_c_hbm.at[:, :, pl.ds(src_new_off, sz)],
+              vmem_dst_lane.at[b, :lkv_sublanes, :, pl.ds(dst_vmem_off, sz)],
+              sem,
+          ).start()
 
-        # new_k_pe_hbm -> vmem_dst_lane[lkv_sublanes:, :, :] (K_pe)
-        pltpu.make_async_copy(
-            new_k_pe_hbm.at[:, :, pl.ds(src_new_off, sz)],
-            vmem_dst_lane.at[b, lkv_sublanes:, :, pl.ds(dst_vmem_off, sz)],
-            sem,
-        ).start()
+          # new_k_pe_hbm -> vmem_dst_lane[lkv_sublanes:hbm_sublanes, :, :]
+          # (K_pe). `new_k_pe` is prepared at the HBM width, so the destination
+          # stops there too.
+          pltpu.make_async_copy(
+              new_k_pe_hbm.at[:, :, pl.ds(src_new_off, sz)],
+              vmem_dst_lane.at[
+                  b, lkv_sublanes:hbm_sublanes, :, pl.ds(dst_vmem_off, sz)
+              ],
+              sem,
+          ).start()
+
+        _start_new_kv()
 
   def copy_out(
       self,
@@ -188,7 +199,8 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
     assert self.window_ref is not None
     vmem_src_lane: Any = self.window_ref.at[slot]
     num_lanes = pltpu.get_tpu_info().num_lanes
-    lkv_sublanes = self.cfgs.aligned_lkv_dim // self.cfgs.serve.packing_kv
+    lkv_sublanes = self.cfgs.lkv_sublanes
+    hbm_sublanes = lkv_sublanes + self.cfgs.hbm_r_sublanes
 
     for b in range(self.cfgs.batch_size):
       do_writeback = schedule_ref.do_writeback[block_idx, b] == 1
@@ -202,18 +214,20 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         src_vmem_off = pl.multiple_of(src_vmem_off, num_lanes)
         sz = pl.multiple_of(sz, num_lanes)
 
-        # Write back concatenated into 4D kv_out_ref
-        pltpu.make_async_copy(
-            vmem_src_lane.at[b, :lkv_sublanes, :, pl.ds(src_vmem_off, sz)],
-            kv_out_ref.at[hbm_p_idx, :lkv_sublanes, :, pl.ds(0, sz)],
-            sem,
-        ).start()
-
-        pltpu.make_async_copy(
-            vmem_src_lane.at[b, lkv_sublanes:, :, pl.ds(src_vmem_off, sz)],
-            kv_out_ref.at[hbm_p_idx, lkv_sublanes:, :, pl.ds(0, sz)],
-            sem,
-        ).start()
+        # Write back concatenated into 4D kv_out_ref. Same adjacency argument
+        # as `copy_in`: one copy covers both halves.
+        def _start_wb(
+            hbm_p_idx=hbm_p_idx, src_vmem_off=src_vmem_off, sz=sz, b=b
+        ):
+          pltpu.make_async_copy(
+              vmem_src_lane.at[b, :hbm_sublanes, :, pl.ds(src_vmem_off, sz)],
+              kv_out_ref.at[hbm_p_idx, :hbm_sublanes, :, pl.ds(0, sz)],
+              sem,
+          ).start()
+        # Writeback only happens on the block that took in new tokens, so in
+        # DECODE two thirds of these are empty. `total_wait_kv_out` is a byte
+        # count, so skipping the issue does not perturb it.
+        _start_wb()
 
   def wait_in(
       self,
@@ -335,16 +349,33 @@ class BatchingQNopeRef(pltpu.BufferedRef):
       q_in_tokens += q_sz
 
     itemsize = jnp.dtype(self.cfgs.serve.dtype_q).itemsize
-    dma_chunk_size = 128 * 4
+    # The minormost dimension of the u32 view, which the reshape below must
+    # preserve. TPU packs sub-word types along *sublanes*, so `bitcast` divides
+    # the second-minor axis by the packing and leaves the lane axis alone: the
+    # packed 4D buffer ends ...x packing x 128 and views as minor 128, whereas
+    # `flat_q`'s 3D buffer ends x aligned_lkv_dim and views as minor 512.
+    # Reshaping that to (-1, 128) is what Mosaic rejects with "Expected the
+    # minormost dimension to be unchanged".
+    minor = self.cfgs.aligned_lkv_dim
+    dma_chunk_size = minor * 4
     q_nope_bytes_per_token = (
         self.cfgs.aligned_num_q_heads * self.cfgs.aligned_lkv_dim * itemsize
     )
-    wait_lanes = (q_in_tokens * q_nope_bytes_per_token) // dma_chunk_size
+    # Fold the division into a Python constant before multiplying by the
+    # dynamic token count. Written as `(q_in_tokens * bytes) // chunk` the
+    # result is a dynamic floor-divide, and Mosaic cannot prove the slice below
+    # is sublane-aligned ("size at dimension 0 divisible by the tile dimension
+    # 8"). As `q_in_tokens * const` the multiple is syntactically visible.
+    rows_per_token = q_nope_bytes_per_token // dma_chunk_size
+    assert rows_per_token % 8 == 0, (
+        f"{rows_per_token=} must be sublane-aligned for the wait slice"
+    )
+    wait_lanes = q_in_tokens * rows_per_token
 
     assert self.window_ref is not None
     vmem_dst: Any = self.window_ref.at[slot]
     vmem_u32 = vmem_dst.bitcast(jnp.uint32)
-    flat_vmem = vmem_u32.reshape((-1, 128))
+    flat_vmem = vmem_u32.reshape((-1, minor))
     pltpu.make_async_copy(
         flat_vmem.at[pl.ds(0, wait_lanes), :],
         flat_vmem.at[pl.ds(0, wait_lanes), :],
@@ -426,7 +457,9 @@ class BatchingQPeRef(pltpu.BufferedRef):
     q_pe_bytes_per_token = (
         self.cfgs.aligned_num_q_heads * self.cfgs.aligned_r_dim * itemsize
     )
-    wait_lanes = (q_in_tokens * q_pe_bytes_per_token) // dma_chunk_size
+    # Constant-folded for the same reason as in `BatchingQNopeRef.wait_in`.
+    rows_per_token = q_pe_bytes_per_token // dma_chunk_size
+    wait_lanes = q_in_tokens * rows_per_token
 
     assert self.window_ref is not None
     vmem_dst: Any = self.window_ref.at[slot]
@@ -494,11 +527,16 @@ class BatchingORef(pltpu.BufferedRef):
       q_src, q_sz = schedule_ref.get_dma_q(block_idx, b)
       q_sz = jnp.where(is_last_k, q_sz, 0)
 
-      pltpu.make_async_copy(
-          vmem_src.at[b, pl.ds(0, q_sz), ...],
-          o_hbm.at[pl.ds(q_src, q_sz), ...],
-          sem,
-      ).start()
+      def _start_o(q_src=q_src, q_sz=q_sz, b=b):
+        pltpu.make_async_copy(
+            vmem_src.at[b, pl.ds(0, q_sz), ...],
+            o_hbm.at[pl.ds(q_src, q_sz), ...],
+            sem,
+        ).start()
+
+      # Output is emitted only at a sequence's last k-block; the rest issue a
+      # zero-length copy. `wait_out` counts bytes, so this is invisible to it.
+      _start_o()
 
   def wait_out(
       self,
@@ -511,12 +549,32 @@ class BatchingORef(pltpu.BufferedRef):
     assert self.sem_sends is not None
     sem: Any = self.sem_sends.at[slot]
     block_idx = grid_indices[0]
-    wait_lanes = schedule_ref.total_wait_o_out[block_idx]
-
+    # `total_wait_o_out` is precomputed in rows of a 128-lane u32 view. Under
+    # `flat_q` the output buffer's minor axis is `aligned_lkv_dim`, so the same
+    # bytes are `minor / 128` times fewer rows -- but rescaling it here would
+    # be a dynamic floor-divide, and Mosaic then cannot prove the slice is
+    # sublane-aligned. Recomputing the token count from the schedule instead
+    # keeps the multiplier a Python constant. The `is_last_k` masking mirrors
+    # `copy_out` above exactly, which is what `total_wait_o_out` counts.
+    minor = self.cfgs.aligned_lkv_dim
+    itemsize = jnp.dtype(self.cfgs.serve.dtype_out).itemsize
+    o_bytes_per_token = (
+        self.cfgs.aligned_num_q_heads * self.cfgs.aligned_lkv_dim * itemsize
+    )
+    rows_per_token = o_bytes_per_token // (minor * 4)
+    assert rows_per_token % 8 == 0, (
+        f"{rows_per_token=} must be sublane-aligned for the wait slice"
+    )
+    o_tokens = 0
+    for b in range(self.cfgs.batch_size):
+      is_last_k = schedule_ref.is_last_k[block_idx, b] == 1
+      _, q_sz = schedule_ref.get_dma_q(block_idx, b)
+      o_tokens += jnp.where(is_last_k, q_sz, 0)
+    wait_lanes = o_tokens * rows_per_token
     assert self.window_ref is not None
     vmem_src: Any = self.window_ref.at[slot]
     vmem_u32 = vmem_src.bitcast(jnp.uint32)
-    flat_src = vmem_u32.reshape((-1, 128))
+    flat_src = vmem_u32.reshape((-1, minor))
     pltpu.make_async_copy(
         flat_src.at[pl.ds(0, wait_lanes), :],
         flat_src.at[pl.ds(0, wait_lanes), :],

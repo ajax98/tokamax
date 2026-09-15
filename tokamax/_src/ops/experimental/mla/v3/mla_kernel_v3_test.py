@@ -14,8 +14,10 @@
 # ==============================================================================
 """Tests for Multi-Head Latent Attention (MLA) V3 kernel."""
 
+import functools
 import gc
 import sys
+import time
 from absl import flags
 from absl import logging
 from absl.testing import absltest
@@ -281,6 +283,138 @@ class MlaRaggedPagedAttentionKernelV3Test(
         1024,  # num_pages
         distribution_override=(2, 4, len(seq_lens)),
     )
+
+
+class MlaV3DecodePerfTest(absltest.TestCase):
+  """Reproduces the best measured v3 decode configuration end to end.
+
+  Workload is the production DeepSeek-V3 decode shape: 128 sequences, one new
+  token each, 9216 tokens of context, FP8 throughout, `page_size=1024`. This is
+  `decode_f8_kv9216` in `mla/arg_specs.py`.
+
+  Measured on TPU7x (jax 0.11.1), device time from xprof:
+
+      v2  (kv=3, q=1, decode_batch_size=8)     0.4033 ms kernel / 0.4612 total
+      v3  this configuration                   0.5445 ms kernel / 0.6628 total
+
+  i.e. v3 is 1.35x v2 on the kernel and 1.44x end to end, down from 1.62x /
+  1.68x before the flags below were added.
+
+  Each was measured individually (kernel time, device):
+
+      single-token mask path  -3.4%
+      disable_bounds_checks   -6.3%   v2 already compiles with these off
+      merged KV DMA           -3.0%   one DMA per cache page instead of two
+      kv_slack_pad_lanes=128  -10.5%  makes the stitch stride an odd multiple
+                                      of 128; a power-of-two stride aliases
+                                      onto VMEM banks and cost +49%
+
+  All but `kv_slack_pad_lanes` are now unconditional kernel behaviour rather
+  than flags, so only that one still appears in the config below.
+
+  Deliberately *not* enabled -- all measured counterproductive on decode:
+  `narrow_scores` (+1.9%), `p_same_dtype_as_v` (+5.9%), `tight_kv_slack`
+  (+49%). The two-step PV deferral is inert here (`q_split == 1`).
+
+  This is a benchmark, not a correctness test; numerics are covered by
+  `MlaRaggedPagedAttentionKernelV3Test` and by `mla/v2_v3_op_test.py`. The
+  assertion is only a loose regression guard.
+  """
+
+  # Generous: the measured wallclock is ~0.93 ms and this is meant to catch a
+  # structural regression (a lost flag, a bad config), not to police noise.
+  _WALLCLOCK_BUDGET_MS = 2.0
+
+  def tearDown(self):
+    super().tearDown()
+    jax.clear_caches()
+    gc.collect()
+
+  def test_decode_f8_best_config(self):
+    if not jax.devices() or jax.devices()[0].platform != "tpu":
+      self.skipTest("Expect TPU")
+
+    page_size = 1024
+    kv_dtype = q_dtype = jnp.float8_e4m3fn
+    seq_lens = [(1, 9216)] * 128
+
+    (
+        ql_nope,
+        q_pe,
+        new_kv_c,
+        new_k_pe,
+        cache_kv,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+    ) = test_base.generate_mla_inputs(
+        seq_lens,
+        128,  # num_heads
+        512,  # lkv_dim
+        64,  # r_dim
+        page_size,
+        q_dtype,
+        kv_dtype,
+        128,  # num_pages (a floor; the real count is 128 * 9 = 1152)
+        rng=np.random.default_rng(1234),
+    )
+
+    # The kernel wants the cache in v3's SEQ_ALONG_LANE layout. Converting here,
+    # outside the timed region, is the point: a deployed system holds the cache
+    # in this layout permanently, and converting per call costs ~10 ms on this
+    # 755 MB cache -- an order of magnitude more than the attention itself.
+    packing = test_base.get_dtype_packing(kv_dtype)
+    cache_kv = utils.transpose_kv_cache_to_v3(cache_kv, packing)
+
+    ql_nope = jnp.transpose(ql_nope, (1, 0, 2))  # kernel wants head-major
+
+    # `cache_kv` is donated and the updated cache chained into the next call.
+    # Without this XLA copies the whole 755 MB cache every iteration (the
+    # kernel's `input_output_aliases` wants to write it in place while the
+    # caller still owns it), and whether that copy overlaps the kernel or
+    # serializes swings the reported time by 2x. Chaining is also what a
+    # serving loop does.
+    @functools.partial(jax.jit, donate_argnames=("cache_kv",))
+    def run(cache_kv):
+      return mla_wrapper.mla_ragged_paged_attention(
+          ql_nope,
+          q_pe,
+          new_kv_c,
+          new_k_pe,
+          cache_kv,
+          kv_lens,
+          page_indices,
+          cu_q_lens,
+          distribution,
+          num_kv_pages_per_block=3,  # bkv_sz = 3 * 1024; 1,2,4 all measured worse
+          num_queries_per_block=1,  # inert on decode (bq_sz is pinned to 1)
+          batch_size=4,  # 8 OOMs at kv=3; 1 and 2 are slower
+          n_buffer=2,  # 3 is within noise
+          kv_slack_pad_lanes=128,
+      )
+
+    out, cache_kv = run(cache_kv)
+    jax.block_until_ready((out, cache_kv))
+
+    times_ms = []
+    for _ in range(10):
+      t0 = time.perf_counter()
+      out, cache_kv = run(cache_kv)
+      jax.block_until_ready((out, cache_kv))
+      times_ms.append((time.perf_counter() - t0) * 1e3)
+
+    median_ms = float(np.median(times_ms))
+    logging.info(
+        "v3 decode_f8 best config: median %.4f ms, min %.4f ms (%d iters,"
+        " wallclock)",
+        median_ms,
+        min(times_ms),
+        len(times_ms),
+    )
+    print(f"\nv3 decode_f8 (page_size=1024) median wallclock: {median_ms:.4f} ms")
+
+    self.assertLess(median_ms, self._WALLCLOCK_BUDGET_MS)
 
 
 if __name__ == "__main__":

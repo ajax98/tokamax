@@ -195,8 +195,6 @@ class MlaSchedule:
   dma_kv_new: SmemArrayOfStructs  # [steps, batch, bkv_p_new]
   total_wait_kv_in: SmemWrapper  # [steps]
   total_wait_kv_out: SmemWrapper  # [steps]
-  total_wait_q_in: SmemWrapper  # [steps]
-  total_wait_o_out: SmemWrapper  # [steps]
   actual_steps: jax.Array  # [1]
 
   cfgs: configs.MlaConfigs = dataclasses.field(metadata=dict(static=True))
@@ -220,7 +218,15 @@ class MlaSchedule:
             (effective_max_steps, cfgs.batch_size, 2)
         ),
         dma_kv_cache=SmemWrapper.create_shape_dtype(
-            (effective_max_steps, cfgs.batch_size, max(1, cfgs.bkv_p_cache), 3)
+            # [src_hbm, valid]. `dst_vmem` used to sit between them, but it
+            # is a compile-time constant recomputed at the use site in
+            # `get_dma_kv_cache`, so it is not stored.
+            (
+                effective_max_steps,
+                cfgs.batch_size,
+                max(1, cfgs.bkv_p_cache),
+                2,
+            )
         ),
         dma_kv_new=SmemArrayOfStructs.create_shape_dtype(
             (effective_max_steps, cfgs.batch_size, cfgs.bkv_p_new),
@@ -229,8 +235,6 @@ class MlaSchedule:
         ),
         total_wait_kv_in=steps_wrapper,
         total_wait_kv_out=steps_wrapper,
-        total_wait_q_in=steps_wrapper,
-        total_wait_o_out=steps_wrapper,
         actual_steps=jax.ShapeDtypeStruct((1,), jnp.int32),  # pytype: disable=bad-argument-type
         cfgs=cfgs,
     )
@@ -242,9 +246,13 @@ class MlaSchedule:
       page_idx: jax.typing.ArrayLike,
   ) -> tuple[jax.Array, jax.Array, jax.Array]:
     src_off = self.dma_kv_cache[step, batch_idx, page_idx, 0]
-    dst_off = self.dma_kv_cache[step, batch_idx, page_idx, 1]
-    sz = self.dma_kv_cache[step, batch_idx, page_idx, 2]
-    return src_off, dst_off, sz
+    # `page_idx` is a Python int at every call site, so this is a constant
+    # and needs no `pl.multiple_of` hint downstream.
+    return (
+        src_off,
+        page_idx << self.cfgs.serve.page_size_log2,
+        self.dma_kv_cache[step, batch_idx, page_idx, 1],
+    )
 
   def get_dma_q(
       self, step: jax.typing.ArrayLike, batch_idx: jax.typing.ArrayLike
@@ -305,8 +313,6 @@ def _mask_out_steps(
 
   schedule_smem.total_wait_kv_in[step] = 0
   schedule_smem.total_wait_kv_out[step] = 0
-  schedule_smem.total_wait_q_in[step] = 0
-  schedule_smem.total_wait_o_out[step] = 0
 
 
 def _write_schedule_to_hbm(
@@ -400,24 +406,11 @@ def _compute_waits(
         kv_out_tokens * kv_bytes_per_token
     ) // dma_chunk_size
 
-    # Q IN
-    q_in_tokens = 0
-    for b in range(cfgs.batch_size):
-      _, q_sz = schedule.get_dma_q(step, b)
-      q_in_tokens += q_sz
-    schedule.total_wait_q_in[step] = (
-        q_in_tokens * q_bytes_per_token
-    ) // dma_chunk_size
-
-    # O OUT
-    o_out_tokens = 0
-    for b in range(cfgs.batch_size):
-      is_last_k = schedule.is_last_k[step, b] == 1
-      _, q_sz = schedule.get_dma_q(step, b)
-      o_out_tokens += jnp.where(is_last_k, q_sz, 0)
-    schedule.total_wait_o_out[step] = (
-        o_out_tokens * o_bytes_per_token
-    ) // dma_chunk_size
+    # Q IN and O OUT totals are not computed: neither has a consumer. The q
+    # BufferedRefs sum `q_sz` themselves in their own `wait_in`, and
+    # `BatchingORef.wait_out` recomputes the output token count inline (it has
+    # to -- rescaling a precomputed 128-lane row count to a 512-lane one is a
+    # dynamic divide Mosaic cannot prove sublane-aligned).
 
   jax.lax.fori_loop(start_step, end_step, body, None)
 
@@ -497,17 +490,16 @@ def compute_metadata(
     p_offset = s_idx * cfgs.serve.pages_per_seq + kv_p_start
 
     for i in range(cfgs.bkv_p_cache):
-      dst_vmem = i << cfgs.serve.page_size_log2
+      dst_vmem = i << cfgs.serve.page_size_log2  # static; see static_kv_dst
       dma_sz = jnp.clip(kv_left_frm_cache - dst_vmem, 0, cfgs.serve.page_size)
       src_hbm = jnp.minimum(p_offset + i, cfgs.serve.num_page_indices - 1)
 
       schedule.dma_kv_cache[step, target_lane, i, 0] = src_hbm
-      schedule.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
-      # Whole-page transfer: the third field is a validity flag, not a size.
-      schedule.dma_kv_cache[step, target_lane, i, 2] = jnp.where(
+      # Whole-page transfer: the validity flag is a flag, not a size. Under
+      # `static_kv_dst` the `dst_vmem` slot is gone and the flag moves up one.
+      schedule.dma_kv_cache[step, target_lane, i, 1] = jnp.where(
           dma_sz > 0, 1, 0
       )
-
     kv_left_frm_new = kv_left - kv_left_frm_cache
     bkv_sz_cache = jnp.minimum(kv_left_frm_cache, cfgs.bkv_sz)
     new_sz = jnp.minimum(cfgs.bkv_sz - bkv_sz_cache, kv_left_frm_new)
@@ -544,7 +536,9 @@ def compute_metadata(
       dma_entry.wb_vmem[...] = slot_start
       dma_entry.set_flags(fetch_val, wb_val)
 
-    if cfgs.block.bq_sz == 1:
+    # Matches `bkv_p_new`, which is gated on `one_new_token` rather than on
+    # the query block size. See `MlaConfigs.one_new_token`.
+    if cfgs.one_new_token:
       assert cfgs.bkv_p_new == 1
       slot_start = (bkv_sz_cache // cfgs.serve.page_size) * cfgs.serve.page_size
       fill_dma_kv_new(0, new_sz, slot_start)

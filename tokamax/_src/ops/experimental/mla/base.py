@@ -27,7 +27,26 @@ from tokamax._src.ops.experimental.mla import reference
 class MultiHeadLatentAttention[C](op.Op[Any, Any, None, C, Any]):
   """Tokamax operator for Multi-Head Latent Attention."""
 
-  @jaxtyping.jaxtyped
+  # Deliberately *not* `@jaxtyping.jaxtyped`, unlike `_fwd` below.
+  #
+  # The annotations stay as documentation, but enforcing them here breaks the
+  # autotuning cache. `AutotuningCache` stores keys as `BoundArguments` whose
+  # arguments have been abstractified to `jax.ShapeDtypeStruct`, and loading
+  # the cache re-binds them -- so an enforced `Float[Array, ...]` rejects every
+  # entry with
+  #
+  #   TypeCheckError: Type-check error whilst checking the parameters of
+  #   ...MultiHeadLatentAttention.bind
+  #
+  # and the op raises instead of falling back to heuristics, which is worse
+  # than having no cache at all. MLA was the only op enforcing its `bind`
+  # annotations; `attention/base.py:477` carries the same `Float[Array, ...]`
+  # signature undecorated, which is why its cache loads and MLA's could not.
+  #
+  # Shapes are still validated where it matters: `v3/kernel.py`'s
+  # `static_validate_inputs` checks every one of these relationships against
+  # each other and against the cache layout, on concrete and abstract values
+  # alike.
   def bind(
       self,
       ql_nope: Float[

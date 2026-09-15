@@ -41,8 +41,29 @@ def calculate_block_sizes(
     num_queries_per_block: int = 4,
     batch_size: int = 2,
     n_buffer: int = 2,
+    q_split: int = 1,
 ) -> tuple[configs.BlockSizes, configs.BlockSizes]:
-  """Calculates default block sizes for decode and prefill/mixed passes."""
+  """Calculates default block sizes for decode and prefill/mixed passes.
+
+  `q_split` divides the prefill/mixed query block into that many sub-chunks by
+  setting `bq_c_sz = bq_sz // q_split`. It had been pinned at 1 -- `bq_c_sz`
+  was always `num_queries_per_block` -- which made `MlaConfigs.q_split` always
+  1, and with it the two-step PV deferral in `chunked_flash_attention` dead
+  code everywhere, not just on DECODE. At `q_split == 1` that deferral is
+  still a no-op: it flushes the single pending chunk immediately after the
+  loop, emitting the same PV in the same order as an inline call.
+
+  Whether splitting the row axis helps depends entirely on how many MXU tiles
+  the rows span, and that differs sharply between the two modes. In DECODE
+  `n_q = 1 * aligned_num_q_heads = 128` -- exactly one 128x128 MXU tile -- so
+  any split divides utilization directly; `head_split` measured +75% at 2 and
+  +402% at 8 for precisely that reason. In prefill at `bq_sz = 32`,
+  `n_q = 32 * 128 = 4096` rows, or 32 tiles; splitting four ways still leaves
+  eight whole tiles per chunk, so the MXU is unaffected while the live score
+  tile drops from [1, 4096, S] to a quarter of that.
+
+  Left at 1 for DECODE regardless, where `bq_sz` is already 1.
+  """
   page_size = serve_cfgs.page_size
   bkv_sz = num_kv_pages_per_block * page_size
 
@@ -55,7 +76,7 @@ def calculate_block_sizes(
   )
   prefill_blocks = configs.BlockSizes(
       bq_sz=num_queries_per_block,
-      bq_c_sz=num_queries_per_block,
+      bq_c_sz=max(1, num_queries_per_block // max(1, q_split)),
       bkv_sz=bkv_sz,
       batch_size=batch_size,
       n_buffer=n_buffer,
@@ -88,6 +109,10 @@ def mla_ragged_paged_attention(
     decode_block_sizes: configs.BlockSizes | None = None,
     prefill_block_sizes: configs.BlockSizes | None = None,
     vmem_limit_bytes: int | None = None,
+    s_dtype=None,
+    p_same_dtype_as_v: bool = False,
+    kv_slack_pad_lanes: int = 0,
+    q_split: int = 1,
     debug_mode: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
   """MLA Ragged paged attention, orchestrated as Decode -> Prefill -> Mixed."""
@@ -125,6 +150,10 @@ def mla_ragged_paged_attention(
       scale_k=k_scale,
       scale_v=v_scale,
       kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+      s_dtype=s_dtype,
+      p_same_dtype_as_v=p_same_dtype_as_v,
+      hbm_kv_dim=cache_kv.shape[1] * cache_kv.shape[2],
+      kv_slack_pad_lanes=kv_slack_pad_lanes,
   )
 
   default_decode, default_prefill = calculate_block_sizes(
@@ -133,6 +162,7 @@ def mla_ragged_paged_attention(
       num_queries_per_block=num_queries_per_block,
       batch_size=batch_size,
       n_buffer=n_buffer,
+      q_split=q_split,
   )
 
   init_cfgs = configs.MlaConfigs(
@@ -158,15 +188,26 @@ def mla_ragged_paged_attention(
   ql_nope_prep = kernel.prepare_q_nope_inputs(
       ql_nope,
       vmem_limit_bytes=vmem_limit_bytes,
+      flat=True,
   )
-  q_pe_prep = kernel.prepare_q_inputs(q_pe)
+  # All three stay at 128-lane alignment. `q_pe` in particular *must*: it is
+  # reshaped with `aligned_r_dim` as its minor dimension, which is the lane
+  # axis. See `MlaConfigs.kv_dim_align`.
+  head_align = init_cfgs.kv_dim_align
+  q_pe_prep = kernel.prepare_q_inputs(q_pe, head_align=head_align, flat=True)
   new_kv_c_prep = kernel.prepare_kv_inputs_for_transposed_kv_cache(
       new_kv_c,
       page_size=page_size,
+      head_align=head_align,
   )
+  # `new_k_pe` is KV, so it follows the *HBM* width: it must land at exactly
+  # the RoPE width the cache stores, which `hbm_r_dim` reads off `cache_kv`.
+  # `q_pe` above must not: it is reshaped with its head dimension as the minor
+  # (lane) axis.
   new_k_pe_prep = kernel.prepare_kv_inputs_for_transposed_kv_cache(
       new_k_pe,
       page_size=page_size,
+      head_align=init_cfgs.hbm_r_dim,
   )
 
   def run_mla_kernel(
@@ -227,18 +268,44 @@ def mla_ragged_paged_attention(
   # output buffer) and `cache_kv` so later passes see earlier writes. The
   # prefill band used to be skipped entirely, which silently dropped those
   # sequences from the output whenever d1 > d0.
-  def run_pass(mode, carry, predicate):
-    return lax.cond(
+  #
+  # Dispatch is a `lax.cond` per band, on a predicate read from `distribution`
+  # at runtime. This is not free: the carry is `(ql_nope, cache_kv)` -- the
+  # output buffer and the whole KV cache -- so both branches must agree on
+  # buffer assignment for them, which constrains aliasing across the branch.
+  # It measures 0.053 ms on `decode_f8_kv9216`, 26% of v3's end-to-end gap
+  # against v2, which pays nothing here because it dispatches by making the
+  # *grid* zero-trip instead (`v2/kernel.py:2511`).
+  #
+  # Two things that do NOT work as replacements, both tried:
+  #
+  #   * A `bands` config letting a caller statically name its non-empty bands.
+  #     Worth ~3.8% on decode, but a `bands` that omits a band `distribution`
+  #     says is non-empty silently drops those sequences from the output. A
+  #     knob whose misuse is silent data loss is not worth 4%.
+  #   * Running every band unconditionally and relying on the grid being
+  #     zero-trip for the empty ones, as v2 does. This aborted the TPU runtime
+  #     ("Fatal Python error: Aborted" surfacing in a later device copy) across
+  #     mla_kernel_v3_test, which sets no bands and is mostly decode-shaped, so
+  #     two zero-step passes ran on nearly every test. Reverted.
+  #
+  # Closing this gap properly means making an empty band's grid genuinely
+  # zero-trip the way v2's is, not skipping the dispatch.
+  passes = [
+      (configs.MlaCase.DECODE, distribution[0] > 0),
+      (configs.MlaCase.PREFILL, distribution[1] - distribution[0] > 0),
+      (configs.MlaCase.MIXED, distribution[2] - distribution[1] > 0),
+  ]
+
+  carry = (ql_nope_prep, cache_kv)
+  for mode, predicate in passes:
+    carry = lax.cond(
         predicate,
-        lambda q_kv: run_mla_kernel(mode, q_kv[0], q_kv[1]),
+        lambda q_kv, m=mode: run_mla_kernel(m, q_kv[0], q_kv[1]),
         lambda q_kv: q_kv,
         carry,
     )
-
-  carry = (ql_nope_prep, cache_kv)
-  carry = run_pass(configs.MlaCase.DECODE, carry, num_decode > 0)
-  carry = run_pass(configs.MlaCase.PREFILL, carry, num_prefill > 0)
-  o_hbm, cache_kv = run_pass(configs.MlaCase.MIXED, carry, num_mixed > 0)
+  o_hbm, cache_kv = carry
 
   output = kernel.prepare_outputs(
       o_hbm,

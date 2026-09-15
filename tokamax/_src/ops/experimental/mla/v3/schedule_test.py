@@ -14,7 +14,6 @@
 
 """Unit tests for the MLA Metadata Scheduler runnable on CPU."""
 
-import dataclasses
 
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.mla.v3 import configs
@@ -95,13 +94,14 @@ class MlaScheduleTest(parameterized.TestCase):
     self.assertEqual(int(sched.dma_q[0, 1, 0]), 1)
     self.assertEqual(int(sched.dma_q[0, 1, 1]), 1)
 
-    # 3. Cached KV DMA (dma_kv_cache): [src_hbm_page_table_offset, dst_vmem, dma_valid]
+    # 3. Cached KV DMA (dma_kv_cache): [src_hbm_page_table_offset, dma_valid].
+    # `dst_vmem` used to sit between the two, but it is `page_idx <<
+    # page_size_log2` -- a compile-time constant -- so it is recomputed at the
+    # use site in `MlaSchedule.get_dma_kv_cache` rather than stored.
     self.assertEqual(int(sched.dma_kv_cache[0, 0, 0, 0]), 0)
-    self.assertEqual(int(sched.dma_kv_cache[0, 0, 0, 1]), 0)
-    self.assertEqual(int(sched.dma_kv_cache[0, 0, 0, 2]), 1)
+    self.assertEqual(int(sched.dma_kv_cache[0, 0, 0, 1]), 1)
     self.assertEqual(int(sched.dma_kv_cache[0, 1, 0, 0]), 1)
-    self.assertEqual(int(sched.dma_kv_cache[0, 1, 0, 1]), 0)
-    self.assertEqual(int(sched.dma_kv_cache[0, 1, 0, 2]), 1)
+    self.assertEqual(int(sched.dma_kv_cache[0, 1, 0, 1]), 1)
 
     # 4. New KV Tokens DMA Struct (dma_kv_new): SeqAlongLane (5 fields)
     entry_s0 = sched.dma_kv_new[0, 0, 0]
@@ -229,16 +229,12 @@ class MlaScheduleTest(parameterized.TestCase):
         cu_q_lens, kv_lens, page_indices, distribution, mla_cfg, interpret=True
     )
 
-    expected_q_wait = (64 * mla_cfg.q_bytes_per_token) // 512
-    self.assertEqual(int(sched.total_wait_q_in[0]), expected_q_wait)
-
+    # Only the KV totals exist: `total_wait_q_in` and `total_wait_o_out` had
+    # no consumer and were removed rather than computed and ignored.
     expected_kv_in_wait = (64 * mla_cfg.kv_bytes_per_token) // 512
     self.assertEqual(int(sched.total_wait_kv_in[0]), expected_kv_in_wait)
 
     self.assertEqual(int(sched.total_wait_kv_out[0]), expected_kv_in_wait)
-
-    expected_o_wait = (64 * mla_cfg.o_bytes_per_token) // 512
-    self.assertEqual(int(sched.total_wait_o_out[0]), expected_o_wait)
 
 class ScheduleCapacityTest(parameterized.TestCase):
   """The HBM schedule must be large enough that no flush is ever dropped.
@@ -421,10 +417,8 @@ class ScheduleCapacityTest(parameterized.TestCase):
   def test_multiplier_is_raised_when_the_shape_needs_it(self):
     """A shape too big for the configured multiplier grows it, not truncates."""
     # A zero SMEM budget pins `max_steps_ub` to its floor of one lane group,
-    # which makes the arithmetic here independent of the host's SMEM size, and
-    # `max_schedule_size_multiplier=1` removes the 16x headroom that would
-    # otherwise absorb any shape this test could reasonably build.
-    kwargs = dict(
+    # which makes the arithmetic here independent of the host's SMEM size.
+    cfgs = self._configs(
         num_seqs=128,
         pages_per_seq=32,
         page_size=256,
@@ -434,13 +428,6 @@ class ScheduleCapacityTest(parameterized.TestCase):
         batch_size=2,
         mode=configs.MlaCase.DECODE,
         smem_fraction=0.0,
-    )
-    cfgs = self._configs(**kwargs)
-    cfgs = dataclasses.replace(
-        cfgs,
-        serve=dataclasses.replace(
-            cfgs.serve, max_schedule_size_multiplier=1
-        ),
     )
 
     # 128 one-token sequences x cdiv(8192, 512) k-blocks / 2 lanes.
@@ -452,8 +439,15 @@ class ScheduleCapacityTest(parameterized.TestCase):
         cfgs.max_steps_needed,
     )
 
-  def test_configured_multiplier_is_a_floor_not_an_override(self):
-    """Sizing never shrinks the buffer below what the caller asked for."""
+  def test_multiplier_is_one_when_the_shape_already_fits(self):
+    """No headroom is bought when a single lane group is enough.
+
+    `max_schedule_size_multiplier` used to be a configurable floor (default
+    16) that sizing could raise but not lower. The floor never bound in
+    practice -- a shape that needs headroom raises the multiplier to ~163
+    against a floor of 16 -- so it is now purely derived, and a shape that
+    fits gets exactly 1.
+    """
     cfgs = self._configs(
         num_seqs=3,
         pages_per_seq=32,
@@ -465,10 +459,7 @@ class ScheduleCapacityTest(parameterized.TestCase):
         mode=configs.MlaCase.DECODE,
     )
     self.assertLess(cfgs.max_steps_needed, cfgs.max_steps_ub)
-    self.assertEqual(
-        cfgs.max_schedule_size_multiplier,
-        cfgs.serve.max_schedule_size_multiplier,
-    )
+    self.assertEqual(cfgs.max_schedule_size_multiplier, 1)
 
 
 if __name__ == "__main__":
