@@ -544,7 +544,7 @@ def compute_metadata(
       dma_entry.wb_vmem[...] = slot_start
       dma_entry.set_flags(fetch_val, wb_val)
 
-    if cfgs.block.bq_sz == 1:
+    if cfgs.one_new_token:
       assert cfgs.bkv_p_new == 1
       slot_start = (bkv_sz_cache // cfgs.serve.page_size) * cfgs.serve.page_size
       fill_dma_kv_new(0, new_sz, slot_start)

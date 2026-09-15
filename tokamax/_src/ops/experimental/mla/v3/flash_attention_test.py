@@ -39,6 +39,19 @@ def _normalize_output(
   return (acc * pl.reciprocal(l_broadcasted, approx=True)).astype(out_dtype)
 
 
+def _fuse(q_nope, q_pe, k_nope, k_pe):
+  """Concatenates the QK operands the way `mla_body` does.
+
+  The kernel never issues the two-dot form: `c_kv` and `k_pe` are adjacent
+  sublane ranges of one ref, so the fused K operand is that ref unsliced, and
+  only Q needs a real concat. These tests build the same thing explicitly.
+  """
+  return (
+      jnp.concatenate([q_nope, q_pe], axis=-1),
+      jnp.concatenate([k_nope, k_pe], axis=1),
+  )
+
+
 class FlashAttentionMathTest(parameterized.TestCase):
 
   def setUp(self):
@@ -117,11 +130,10 @@ class FlashAttentionMathTest(parameterized.TestCase):
     l_prev = jnp.zeros((n_q, 128), dtype=jnp.float32)
     o_prev = jnp.zeros((n_q, self.lkv_dim), dtype=jnp.float32)
 
+    q_fused, k_fused = _fuse(q_nope, q_pe, k_nope, k_pe)
     p, alpha_list, m_next, l_next = flash_attention.flash_attention_qk_softmax(
-        q_nope,
-        q_pe,
-        k_nope,
-        k_pe,
+        q_fused,
+        k_fused,
         m_prev,
         l_prev,
         cfgs=mla_cfg,
@@ -189,16 +201,18 @@ class FlashAttentionMathTest(parameterized.TestCase):
     l0 = jnp.zeros((n_q, 128), dtype=jnp.float32)
     o0 = jnp.zeros((n_q, self.lkv_dim), dtype=jnp.float32)
 
+    q_fused, k0_fused = _fuse(q_nope, q_pe, k0_nope, k0_pe)
     p0, alpha0, m1, l1 = flash_attention.flash_attention_qk_softmax(
-        q_nope, q_pe, k0_nope, k0_pe, m0, l0, cfgs=mla_cfg
+        q_fused, k0_fused, m0, l0, cfgs=mla_cfg
     )
     acc1 = flash_attention.flash_attention_pv(
         p0, k0_nope, alpha0, o0, cfgs=mla_cfg
     )
 
     # Iteration 1 (Block 1) - matches kernel VMEM scratch state [n_q, 128] / [n_q, d_nope]
+    _, k1_fused = _fuse(q_nope, q_pe, k1_nope, k1_pe)
     p1, alpha1, m2, l2 = flash_attention.flash_attention_qk_softmax(
-        q_nope, q_pe, k1_nope, k1_pe, m1, l1[-1], cfgs=mla_cfg
+        q_fused, k1_fused, m1, l1[-1], cfgs=mla_cfg
     )
     acc2 = flash_attention.flash_attention_pv(
         p1, k1_nope, alpha1, acc1[-1], cfgs=mla_cfg
@@ -250,11 +264,11 @@ class FlashAttentionMathTest(parameterized.TestCase):
     o_prev = jnp.zeros((n_q, self.lkv_dim), dtype=jnp.float32)
 
     # 1. Chunked execution (q_split = 4, chunk size = 2)
+    q_fused, k_fused = _fuse(q_nope, q_pe, k_nope, k_pe)
     m_chunk, l_chunk, o_chunk = flash_attention.chunked_flash_attention(
-        q_nope,
-        q_pe,
+        q_fused,
+        k_fused,
         k_nope,
-        k_pe,
         m_prev,
         l_prev,
         o_prev,
@@ -266,7 +280,7 @@ class FlashAttentionMathTest(parameterized.TestCase):
 
     # 2. Unchunked single pass reference
     p_ref, a_ref, m_ref, l_ref = flash_attention.flash_attention_qk_softmax(
-        q_nope, q_pe, k_nope, k_pe, m_prev, l_prev, cfgs=mla_cfg
+        q_fused, k_fused, m_prev, l_prev, cfgs=mla_cfg
     )
     acc_ref = flash_attention.flash_attention_pv(
         p_ref, k_nope, a_ref, o_prev, cfgs=mla_cfg

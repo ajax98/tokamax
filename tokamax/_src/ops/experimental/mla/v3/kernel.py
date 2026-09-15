@@ -51,7 +51,9 @@ def static_validate_inputs(
     *,
     cfgs: configs.MlaConfigs,
 ) -> None:
-  """Statically validates input shapes, dtypes, and 4D transposed layout constraints."""
+  """Statically validates input shapes, dtypes, and 4D transposed layout constraints.
+
+  """
   if len(ql_nope.shape) != 3:
     raise ValueError(f"Expected 3D array for {ql_nope.shape=}")
   if len(q_pe.shape) != 3:
@@ -63,17 +65,18 @@ def static_validate_inputs(
 
   if ql_nope.shape[0] != q_pe.shape[1]:
     raise ValueError(
-        f"Expected ql_nope num_heads {ql_nope.shape[0]=} to equal q_pe"
-        f" num_heads {q_pe.shape[1]=}"
+        f"Expected ql_nope num_heads {ql_nope.shape[0]=} to equal"
+        f" q_pe num_heads {q_pe.shape[1]=}"
     )
   if ql_nope.shape[1] != q_pe.shape[0]:
     raise ValueError(
-        f"Expected ql_nope num_tokens {ql_nope.shape[1]=} to equal q_pe"
-        f" num_tokens {q_pe.shape[0]=}"
+        f"Expected ql_nope num_tokens {ql_nope.shape[1]=} to equal"
+        f" q_pe num_tokens {q_pe.shape[0]=}"
     )
   if ql_nope.shape[1] != new_kv_c.shape[0]:
     raise ValueError(
-        f"Expected {ql_nope.shape[1]=} to be equal to {new_kv_c.shape[0]=}"
+        f"Expected {ql_nope.shape[1]=} to be equal to"
+        f" {new_kv_c.shape[0]=}"
     )
   if new_kv_c.shape[0] != new_k_pe.shape[0]:
     raise ValueError(
@@ -90,8 +93,10 @@ def static_validate_inputs(
 
   actual_lkv_dim = ql_nope.shape[-1]
   actual_r_dim = q_pe.shape[-1]
-  lkv_dim = utils.align_to(actual_lkv_dim, 128)
-  r_dim = utils.align_to(actual_r_dim, 128)
+  # Must mirror `MlaConfigs.kv_dim_align`: each part is padded to 128 lanes.
+  align = cfgs.kv_dim_align
+  lkv_dim = utils.align_to(actual_lkv_dim, align)
+  r_dim = utils.align_to(actual_r_dim, align)
 
   if cache_kv.ndim != 4:
     raise ValueError(
@@ -113,10 +118,12 @@ def static_validate_inputs(
     raise ValueError(f"Expected {page_size=} to be a multiple of 128.")
 
   kv_dim = kv_sublanes * kv_packing
-  aligned_kv_dim = utils.align_to(kv_dim, 128)
-  if lkv_dim + r_dim != aligned_kv_dim:
+  if kv_dim != cfgs.aligned_kv_dim:
     raise ValueError(
-        f"Expected {lkv_dim=} + {r_dim=} to be equal to {aligned_kv_dim=}"
+        f"cache_kv {kv_dim=} (from {kv_sublanes=} * {kv_packing=}) does not"
+        f" match {cfgs.aligned_kv_dim=}"
+        f" (= aligned_lkv_dim {cfgs.aligned_lkv_dim} + aligned_r_dim"
+        f" {cfgs.aligned_r_dim})"
     )
 
   if not (cache_kv.dtype == new_kv_c.dtype):
@@ -193,12 +200,22 @@ def static_validate_inputs(
 
 def prepare_q_inputs(
     q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim],
+    head_align: int = 128,
 ) -> jax.Array:
-  max_num_tokens, actual_num_q_heads, actual_head_dim = q.shape
+  """Pads q to [max_num_tokens, num_q_heads, head_dim].
+
+  Kept 3D. The packed `words x packing x 128` form this used to produce cost
+  a T(32,128) <-> T(4,128) relayout at the HBM boundary that the kernel then
+  undid, worth 18% on decode, so `mla_body` now consumes the 3D layout
+  unconditionally.
+  """
+  # `head_align` must match `MlaConfigs.kv_dim_align` for q_pe: the QK-PE dot
+  # contracts q_pe against k_pe over this dimension, so the two must agree.
+  _, actual_num_q_heads, actual_head_dim = q.shape
   packing_q = utils.get_dtype_packing(q.dtype)
   num_q_heads = utils.align_to(actual_num_q_heads, packing_q)
-  head_dim = utils.align_to(actual_head_dim, 128)
-  q = jnp.pad(
+  head_dim = utils.align_to(actual_head_dim, head_align)
+  return jnp.pad(
       q,
       (
           (0, 0),
@@ -207,17 +224,16 @@ def prepare_q_inputs(
       ),
       constant_values=0,
   )
-  q_pe_words = (num_q_heads * head_dim) // (128 * packing_q)
-  return q.reshape((max_num_tokens, q_pe_words, packing_q, 128))
 
 
 def prepare_q_nope_inputs(
     q: jax.Array,  # [actual_num_q_heads, max_num_tokens, actual_head_dim]
     vmem_limit_bytes: int | None = None,
 ) -> jax.Array:
-  """Packs and physically transposes q_nope to token-major layout.
+  """Pads and physically transposes q_nope to token-major layout.
 
-  Returns: [max_num_tokens, q_nope_words, packing_q, 128]
+  Returns: [max_num_tokens, num_q_heads, head_dim], kept 3D for the same
+  reason as `prepare_q_inputs`.
   """
   del vmem_limit_bytes
   actual_num_q_heads, actual_max_num_tokens, actual_head_dim = q.shape
@@ -227,24 +243,22 @@ def prepare_q_nope_inputs(
 
   sublane_multiple = packing_q * 8
   max_num_tokens = utils.align_to(actual_max_num_tokens, sublane_multiple)
+  head_pad = (0, num_q_heads - actual_num_q_heads)
+  token_pad = (0, max_num_tokens - actual_max_num_tokens)
+  dim_pad = (0, head_dim - actual_head_dim)
   q = jnp.pad(
       q,
-      (
-          (0, num_q_heads - actual_num_q_heads),
-          (0, max_num_tokens - actual_max_num_tokens),
-          (0, head_dim - actual_head_dim),
-      ),
+      (head_pad, token_pad, dim_pad),
       constant_values=0,
   )
-  q = jnp.transpose(q, (1, 0, 2))
-  q_nope_words = (num_q_heads * head_dim) // (128 * packing_q)
-  return q.reshape((max_num_tokens, q_nope_words, packing_q, 128))
+  return jnp.transpose(q, (1, 0, 2))
 
 
 def prepare_kv_inputs_for_transposed_kv_cache(
     kv: jax.Array,
     page_size: int = 128,
     kv_packing: int | None = None,
+    head_align: int = 128,
 ) -> jax.Array:
   """Pads and transposes new KV inputs to [sublanes, kv_packing, max_num_tokens]."""
   max_num_tokens, actual_head_dim = kv.shape
@@ -256,7 +270,7 @@ def prepare_kv_inputs_for_transposed_kv_cache(
     pad = pad_multiple - (max_num_tokens % pad_multiple)
     kv = jnp.pad(kv, ((0, pad), (0, 0)), constant_values=0)
 
-  aligned_head_dim = utils.align_to(actual_head_dim, 128)
+  aligned_head_dim = utils.align_to(actual_head_dim, head_align)
   if aligned_head_dim != actual_head_dim:
     pad = aligned_head_dim - actual_head_dim
     kv = jnp.pad(kv, ((0, 0), (0, pad)), constant_values=0)
@@ -274,7 +288,9 @@ def prepare_outputs(
     actual_head_dim: int,
     vmem_limit_bytes: int | None = None,
 ) -> jax.Array:
-  """Physically transposes output activations back to head-major layout."""
+  """Physically transposes output activations back to head-major layout.
+
+  """
   del vmem_limit_bytes
   packing_q = utils.get_dtype_packing(out.dtype)
   num_q_heads = utils.align_to(actual_num_q_heads, packing_q)
@@ -371,19 +387,19 @@ def calculate_and_store_out(
   """Normalizes accumulated attention output by denominator l and stores to o_vref."""
 
   def _accum(b_idx: int | jax.Array, batch_acc: jax.Array, batch_l: jax.Array):
-    batch_l = utils.broadcast_minor(batch_l, batch_acc.shape)
-    if (
+    exact_div = (
         cfgs.serve.dtype_out == jnp.float32
         or cfgs.serve.dtype_out == batch_l.dtype == jnp.bfloat16
-    ):
+    )
+    batch_l = utils.broadcast_minor(batch_l, batch_acc.shape)
+    if exact_div:
       result = lax.div(batch_acc, batch_l)
     else:
       result = batch_acc * pl.reciprocal(batch_l, approx=True)
     out = result.astype(cfgs.serve.dtype_out)
-    o_words = (cfgs.aligned_num_q_heads * cfgs.aligned_lkv_dim) // (
-        128 * cfgs.serve.packing_q
+    out = out.reshape(
+        cfgs.block.bq_sz, cfgs.aligned_num_q_heads, cfgs.aligned_lkv_dim
     )
-    out = out.reshape(cfgs.block.bq_sz, o_words, cfgs.serve.packing_q, 128)
     o_vref[b_idx, ...] = out
 
   if cfgs.fuse_accum:
@@ -426,6 +442,7 @@ def mla_body(
   processed_kv_len = []
   bkv_sz_frm_cache_list = []
   new_kv_len_start_list = []
+  new_sz_list = []
   for b_idx in range(cfgs.batch_size):
     s_idx = schedule_ref.s_idx[step, b_idx]
     is_valid = s_idx != -1
@@ -451,27 +468,33 @@ def mla_body(
 
     bkv_sz_frm_cache_list.append(bkv_sz_frm_cache)
     new_kv_len_start_list.append(new_kv_len_start)
-
-  # Loads for every lane are issued before any store, per
-  # `stitch_new_kv_lane`'s "separated to avoid RAW hazards".
-  stitch_results = [
-      stitch_utils.stitch_new_kv_lane(
-          kv_in_vref,
-          b_idx,
-          bkv_sz_frm_cache_list[b_idx],
-          new_kv_len_start_list[b_idx],
-          cfgs=cfgs,
-      )
-      for b_idx in range(cfgs.batch_size)
-  ]
-  for b_idx in range(cfgs.batch_size):
-    stitch_utils.store_new_kv_lane(
-        kv_in_vref,
-        b_idx,
-        stitch_results[b_idx],
-        cfgs=cfgs,
+    # Mirrors `schedule.k_loop`'s `new_sz`: how many unpaged new tokens land in
+    # this block. Zero for every step except the one holding the sequence's
+    # new token, which is what `gate_stitch` keys on.
+    new_sz_list.append(
+        jnp.minimum(cfgs.bkv_sz - bkv_sz_frm_cache, kv_left_frm_new)
     )
 
+  # Skip the whole merge -- strided loads, roll, strided stores -- on lanes
+  # with no new tokens. Only one step per sequence has any, so ~2/3 of
+  # lane-steps elide. Each lane owns a disjoint slot, so there is no
+  # cross-lane hazard in skipping the store. -2.7% on decode.
+  for b_idx in range(cfgs.batch_size):
+
+    @pl.when(new_sz_list[b_idx] > 0)
+    def _stitch_and_store(b_idx=b_idx):
+      stitch_utils.store_new_kv_lane(
+          kv_in_vref,
+          b_idx,
+          stitch_utils.stitch_new_kv_lane(
+              kv_in_vref,
+              b_idx,
+              bkv_sz_frm_cache_list[b_idx],
+              new_kv_len_start_list[b_idx],
+              cfgs=cfgs,
+          ),
+          cfgs=cfgs,
+      )
   lkv_sublanes = cfgs.aligned_lkv_dim // cfgs.serve.packing_kv
   q_nope = q_nope_vref[...].reshape(cfgs.batch_size, -1, cfgs.aligned_lkv_dim)
   q_pe = q_pe_vref[...].reshape(cfgs.batch_size, -1, cfgs.aligned_r_dim)
@@ -479,19 +502,23 @@ def mla_body(
   c_kv = kv_in_vref[:, :lkv_sublanes, :, : cfgs.bkv_sz].reshape(
       cfgs.batch_size, cfgs.aligned_lkv_dim, cfgs.bkv_sz
   )
-  k_pe = kv_in_vref[:, lkv_sublanes:, :, : cfgs.bkv_sz].reshape(
-      cfgs.batch_size, cfgs.aligned_r_dim, cfgs.bkv_sz
+  # `c_kv` and the RoPE part are adjacent sublane ranges of `kv_in_vref`, so
+  # their concatenation is just the un-sliced ref -- no copy, which is why the
+  # K side of the fusion is free. Only Q needs a real concat, and both halves
+  # are lane-multiples of 128. `c_kv` is still sliced out on its own because
+  # PV accumulates against the narrower operand.
+  k_fused = kv_in_vref[..., : cfgs.bkv_sz].reshape(
+      cfgs.batch_size, cfgs.aligned_kv_dim, cfgs.bkv_sz
   )
-
+  q_fused = jnp.concatenate([q_nope, q_pe], axis=-1)
   is_last_k_list = [
       schedule_ref.is_last_k[step, b] == 1 for b in range(cfgs.batch_size)
   ]
 
   m_carry, l_next, acc_next = flash_attention.chunked_flash_attention(
-      q_nope=q_nope,
-      q_pe=q_pe,
+      q_fused=q_fused,
+      k_fused=k_fused,
       k_nope=c_kv,
-      k_pe=k_pe,
       m_prev=m_scratch_ref[...],
       l_prev=l_scratch_ref[...],
       o_prev=acc_scratch_ref[...],
@@ -710,7 +737,7 @@ def _mla_ragged_paged_attention_kernel(
       ),
       compiler_params=pltpu.CompilerParams(
           vmem_limit_bytes=cfgs.vmem_limit_bytes,
-          disable_bounds_checks=False,
+          disable_bounds_checks=True,
       ),
       input_output_aliases={ql_nope_hbm_idx: 0, cache_kv_hbm_idx: 1},
       name=get_kernel_name(cfgs),
