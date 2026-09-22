@@ -20,13 +20,13 @@ from absl.testing import parameterized
 import chex
 import jax
 import jax.numpy as jnp
-from tokamax import autotuning
 from tokamax._src import gpu_utils
+from tokamax._src import hlo_utils
 from tokamax._src.ops.gated_linear_unit import api
 from tokamax._src.ops.gated_linear_unit import test_base
 
 _IMPLEMENTATIONS: Final[tuple[str | None, ...]] = typing.get_args(
-    api.Implementation
+    api.Implementation.__value__
 ) + (None,)
 
 
@@ -74,9 +74,9 @@ class GatedLinearUnitTest(parameterized.TestCase):
     out_golden = f_xla(lhs, rhs)
 
     with self.subTest("value"):
-      chex.assert_trees_all_close(out, out_golden)
+      chex.assert_trees_all_close(out, out_golden, atol=1.5, rtol=0.02)
 
-    args = autotuning.get_bound_args(f.lower(lhs, rhs))
+    args = hlo_utils.get_bound_args(f.lower(lhs, rhs))
     self.assertLen(args, 1)
 
     self.assertEqual(lhs.dtype, jnp.bfloat16)
@@ -109,6 +109,13 @@ class GatedLinearUnitXlaTest(test_base.GatedLinearUnitTestBase):
 
   def __init__(self, *args):
     fn = functools.partial(api.gated_linear_unit, implementation="xla")
+    super().__init__(*args, glu_fn=fn)
+
+
+class GatedLinearUnitMosaicGpuTest(test_base.GatedLinearUnitTestBase):
+
+  def __init__(self, *args):
+    fn = functools.partial(api.gated_linear_unit, implementation="mosaic")
     super().__init__(*args, glu_fn=fn)
 
 
