@@ -34,12 +34,20 @@ from tokamax._src.autotuning import cache as cache_lib
 from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.attention import api as attention_api
 from tokamax._src.ops.attention import base as attention_base
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import api as causal_conv1d_gated_delta_rule_api
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import base as causal_conv1d_gated_delta_rule_base
+from tokamax._src.ops.experimental.batched_rpa import api as batched_rpa_api
+from tokamax._src.ops.experimental.batched_rpa import base as batched_rpa_base
 from tokamax._src.ops.experimental.kda import api as kda_api
 from tokamax._src.ops.experimental.kda import base as kda_base
 from tokamax._src.ops.experimental.mla import api as mla_api
 from tokamax._src.ops.experimental.mla import base as mla_base
+from tokamax._src.ops.experimental.tpu.splash_attention import api as splash_attention_api
+from tokamax._src.ops.experimental.tpu.splash_attention import base as splash_attention_base
 from tokamax._src.ops.gated_linear_unit import api as glu_api
 from tokamax._src.ops.gated_linear_unit import base as glu_base
+from tokamax._src.ops.linear_softmax_cross_entropy_loss import api as linear_softmax_cross_entropy_loss_api
+from tokamax._src.ops.linear_softmax_cross_entropy_loss import base as linear_softmax_cross_entropy_loss_base
 from tokamax._src.ops.normalization import api as normalization_api
 from tokamax._src.ops.normalization import base as normalization_base
 from tokamax._src.ops.ragged_dot import api as ragged_dot_api
@@ -50,6 +58,8 @@ from tokamax._src.ops.ragged_gather_reduce import api as ragged_gather_reduce_ap
 from tokamax._src.ops.ragged_gather_reduce import base as ragged_gather_reduce_base
 from tokamax._src.ops.ragged_scatter import api as ragged_scatter_api
 from tokamax._src.ops.ragged_scatter import base as ragged_scatter_base
+from tokamax._src.ops.triangle_multiplication import api as triangle_multiplication_api
+from tokamax._src.ops.triangle_multiplication import base as triangle_multiplication_base
 import tqdm
 
 type BoundArgsAutotuningData = tuple[
@@ -201,44 +211,10 @@ _AUTOTUNING_RESULT_ADAPTER = pydantic.TypeAdapter(AutotuningResult)
 _BOUND_ARGS_ADAPTER = pydantic_lib.TypeAdapter(op_lib.BoundArguments)
 
 
-def get_bound_args[**P](
-    f: (
-        Callable[P, Any]
-        | hlo_utils.HloComputation
-    ),
-    *args: P.args,
-    **kwargs: P.kwargs,
-) -> tuple[op_lib.BoundArguments, ...]:
-  """Returns a tuple of unique BoundArguments for all Tokamax ops in `f`.
-
-  Args:
-    f: A callable, or a lowered JAX function.
-    *args: Positional arguments to `f` (only valid if `f` is callable).
-    **kwargs: Keyword arguments to `f` (only valid if `f` is callable).
-
-  Returns:
-    A tuple of unique BoundArguments for all Tokamax ops in `f`.
-  """
-  if callable(f):
-    if not isinstance(f, jax.stages.Wrapped):
-      f = jax.jit(f)
-    f = f.lower(*args, **kwargs)
-  elif args or kwargs:
-    raise ValueError("`args` / `kwargs` are only supported if `f` is callable.")
-
-  bound_args = hlo_utils.get_opspecs(f)
-
-  # Filter out bound args so that only unique ones remain.
-  seen_keys = set()
-  unique_bound_args = []
-  for bound_arg in bound_args:
-    # The chosen config is serialized into the HLO - remove it here.
-    bound_arg = bound_arg.replace(op=bound_arg.op.replace(config=None))
-    key = bound_arg.autotuning_cache_key
-    if (bound_arg.op.__class__.__name__, key) not in seen_keys:
-      seen_keys.add((bound_arg.op.__class__.__name__, key))
-      unique_bound_args.append(bound_arg)
-  return tuple(unique_bound_args)
+# Re-exported from `hlo_utils`, which is where it lives so that callers only
+# wanting to read ops back out of a lowered function need not import the op
+# modules that `_API_IMPLEMENTATIONS` below requires.
+get_bound_args = hlo_utils.get_bound_args
 
 
 def dump_bound_args_to_json(bound_args: Sequence[op_lib.BoundArguments]) -> str:
@@ -296,7 +272,18 @@ _API_IMPLEMENTATIONS: Final[
     ragged_gather_reduce_base.RaggedGatherReduce: (
         ragged_gather_reduce_api.IMPLEMENTATIONS
     ),
+    batched_rpa_base.BatchedRpa: batched_rpa_api.IMPLEMENTATIONS,
     kda_base.KimiDeltaAttention: kda_api.IMPLEMENTATIONS,
+    linear_softmax_cross_entropy_loss_base.LinearSoftmaxCrossEntropyLoss: (
+        linear_softmax_cross_entropy_loss_api.IMPLEMENTATIONS
+    ),
+    triangle_multiplication_base.TriangleMultiplication: (
+        triangle_multiplication_api.IMPLEMENTATIONS
+    ),
+    splash_attention_base.SplashAttention: splash_attention_api.IMPLEMENTATIONS,
+    causal_conv1d_gated_delta_rule_base.CausalConv1dGatedDeltaRule: (
+        causal_conv1d_gated_delta_rule_api.IMPLEMENTATIONS
+    ),
 })
 
 

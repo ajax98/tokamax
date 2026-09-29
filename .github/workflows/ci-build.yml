@@ -1,11 +1,26 @@
 name: CI-Build
 
+#  Shards are declared in `.github/ci/shards.py`, which also builds the job
+#  matrix and checks that every test file is claimed by some shard.
+#
+#  Which shards a pull request's changed files can reach is computed from the
+#  import graph in `.github/ci/deps.py` and reported in the run summary.
+#  Whether that decides anything is `SHARD_SELECTION` below: while it is
+#  `report` the selection is logged and every shard runs anyway. Anything
+#  that cannot be analysed runs everything, as does a `workflow_dispatch`.
+#
+#  `collect-tests` is the one job that ignores all of that and imports the
+#  whole suite in a single process, because some failures are properties of
+#  the collection rather than of any test.
+#
+#  Require `shard-all-tests-passed` in branch protection, not the shard jobs,
+#  whose names and number change whenever the SHARDS table is rebalanced.
 on:
   # Trigger the workflow on pull request for the main branch.
   pull_request:
     branches:
       - main
-  # Event manually triggered (in the Github UI)
+  # Event manually triggered (in the Github UI). This also forces all shards to run, so can be helpful for debugging.
   workflow_dispatch:
 
 # Constants for the workflow that are shared across jobs.
@@ -13,9 +28,16 @@ env:
   JAX_ENABLE_X64: 0
   JAX_TRACEBACK_FILTERING: off
   UV_HTTP_TIMEOUT: 300
+  # Change-based test selection. `report` computes which shards a change
+  # reaches and logs it, but runs every shard regardless; `enforce` lets it
+  # decide the matrix. This is the only line to change to turn it on, and the
+  # only one to change back if it drops something it should not have.
+  SHARD_SELECTION: enforce
 
 permissions:
   contents: read
+  # For the jobs API, which `shard-all-tests-passed` reads to write a summary.
+  actions: read
 # We should cancel the previous run if it's still running and there is a new commit.
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
@@ -23,141 +45,171 @@ concurrency:
 
 # These jobs should build Tokamax and run the tests on Google Cloud resources.
 jobs:
-  build-matrix:
+  shard-matrix:
     runs-on: ubuntu-latest
     outputs:
       include: ${{ steps.compute.outputs.include }}
+      # The pytest flags that decide which tests are selected, as opposed to
+      # how they are reported. Emitted by the same module that builds the
+      # shard paths so the two cannot disagree about what the suite is.
+      pytest_flags: ${{ steps.compute.outputs.pytest_flags }}
     steps:
       - name: Checkout Tokamax
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      - name: Compute affected shards
+          # Full history, so that `origin/<base>` and the merge base with it
+          # both exist. 
+          fetch-depth: 0
+
+      - name: Test the CI scripts
+        # `shards.py` decides what every other job runs
+        run: python3 -m unittest discover -s .github/ci -p '*_test.py'
+
+      - name: Decide which files changed
+        # Writes /tmp/changed, which narrows the matrix below. Every path that
+        # cannot produce a trustworthy list leaves the file absent, and an
+        # absent file means every shard runs: too many jobs costs runner
+        # minutes, too few reports a change green that was never tested.
+        env:
+          # The branch the pull request targets. Empty on `workflow_dispatch`,
+          # which has no base to diff against, and so has to mean everything.
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          if [[ -z "${BASE_REF}" ]]; then
+            echo "No base ref on ${GITHUB_EVENT_NAME}: every shard runs."
+            exit 0
+          fi
+          # Diff against the base branch merge base to isolate PR changes.
+          # Use `--no-renames` so old paths in renamed files are reported
+          # directly, allowing dependency tracking of the previous module name.
+          # On any git failure, fall back to running all shards.
+          if ! git diff --no-renames --name-only -z \
+              "origin/${BASE_REF}...HEAD" > /tmp/changed.tmp; then
+            echo "::warning::Could not diff against origin/${BASE_REF};" \
+                 "every shard runs."
+            rm -f /tmp/changed.tmp
+            exit 0
+          fi
+          mv /tmp/changed.tmp /tmp/changed
+          echo "Changed against origin/${BASE_REF}:"
+          tr '\0' '\n' < /tmp/changed | sed 's/^/  /'
+
+      - name: Build test matrix
         id: compute
         run: |
-          # This script describes what tests are in a given shard. 
-          # All tests are automatically assigned a shard (oftentimes catchall).
-          # When specifying a test to a shard, ignore that test the shard by default.
-          # These shards are created first to distribute the load by timing, 
-          # then by test area.
-          python3 - <<'PYEOF' >> "$GITHUB_OUTPUT"
-          import json
+          set -o pipefail
+          # `--changed-from` narrows the matrix to the shards those files can
+          # reach, via the import graph in `.github/ci/deps.py`. The step
+          # above writes the file only when there is something to diff
+          # against; with no file the flag is omitted and every shard runs.
+          narrow=()
+          if [[ -f /tmp/changed ]]; then
+            narrow=(--changed-from /tmp/changed)
+            # Anything but `enforce` reports the selection and runs every
+            # shard, so a typo here fails towards running too much.
+            if [[ "${SHARD_SELECTION}" != "enforce" ]]; then
+              narrow+=(--dry-run)
+            fi
+          fi
+          if ! python3 .github/ci/shards.py matrix "${narrow[@]}" \
+              > /tmp/outputs.txt 2> /tmp/summary.txt; then
+            cat /tmp/summary.txt
+            exit 1
+          fi
+          cat /tmp/outputs.txt >> "$GITHUB_OUTPUT"
+          cat /tmp/summary.txt
+          # Add to run summary.
+          {
+            echo '## Shard selection'
+            echo
+            sed -n 's/^selection: //p' /tmp/summary.txt
+          } >> "${GITHUB_STEP_SUMMARY}"
 
-          SHARD_TEST_PATHS = {
-              'attn_base_test': (
-                  'tokamax/_src/ops/attention/base_test.py::MaskTest '
-                  'tokamax/_src/ops/attention/base_test.py::DotProductAttentionTest'
-              ),
-              'attn_base_vjp_test': (
-                  'tokamax/_src/ops/attention/base_test.py::DotProductAttentionWithExplicitVjpTest'
-              ),
-              'attn_api_test': 'tokamax/_src/ops/attention/api_test.py',
-              'attn_pallas_mosaic_gpu_test': 'tokamax/_src/ops/attention/pallas_mosaic_gpu_test.py',
-              'attn_pallas_mosaic_tpu_test': 'tokamax/_src/ops/attention/pallas_mosaic_tpu_test.py',
-              'attn_pallas_triton_test': 'tokamax/_src/ops/attention/pallas_triton_test.py',
-              'attn_jax_nn_test': 'tokamax/_src/ops/attention/jax_nn_test.py',
-              'attn_xla_chunked_test': 'tokamax/_src/ops/attention/xla_chunked_test.py',
-              'gmm_v2_perf': 'tokamax/_src/ops/experimental/gmm_v2/gmm_v2_perf_test.py',
-              'gmm_v2_kernel': 'tokamax/_src/ops/experimental/gmm_v2/gmm_v2_test.py',
-              'op_test': 'tokamax/_src/ops/op_test.py',
-              'topk': 'tokamax/_src/ops/experimental/tpu/topk/pallas_mosaic_tpu_test.py',
-              'ragged_dot_sm100_fp8_quant': 'tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_fp8_quant_test.py',
-              'ragged_dot_sm100_i8_quant': 'tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_i8_quant_test.py',
-              'ragged_dot_pallas_mosaic_gpu': 'tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_test.py',
-              'ragged_dot_pallas_triton': 'tokamax/_src/ops/ragged_dot/pallas_triton_test.py',
-              'ragged_dot_misc': (
-                  '--ignore=tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_fp8_quant_test.py '
-                  '--ignore=tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_i8_quant_test.py '
-                  '--ignore=tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_test.py '
-                  '--ignore=tokamax/_src/ops/ragged_dot/pallas_triton_test.py '
-                  'tokamax/_src/ops/ragged_dot/ '
-                  'tokamax/_src/ops/triangle_multiplication/ '
-                  'tokamax/_src/ops/ragged_gather/ '
-                  'tokamax/_src/ops/ragged_gather_reduce/'
-              ),
-              'linear_softmax_and_experimental': (
-                  '--ignore=tokamax/_src/ops/experimental/tpu/topk/pallas_mosaic_tpu_test.py '
-                  '--ignore=tokamax/_src/ops/experimental/tpu/splash_attention/ '
-                  '--ignore=tokamax/_src/ops/experimental/gmm_v2/ '
-                  'tokamax/_src/ops/linear_softmax_cross_entropy_loss/ '
-                  'tokamax/_src/ops/experimental/'
-              ),
-              'splash_attention_kernel': (
-                  'tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_kernel_test.py'
-              ),
-              'splash_attention_misc': (
-                  '--ignore=tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_kernel_test.py '
-                  'tokamax/_src/ops/experimental/tpu/splash_attention/'
-              ),
-              'misc_small_ops': (
-                  'tokamax/_src/ops/flex_attention/ '
-                  'tokamax/_src/ops/ragged_scatter/ '
-                  'tokamax/_src/ops/gated_linear_unit/ '
-                  'tokamax/_src/ops/normalization/'
-              ),
-              'tokamax_test': 'tokamax/tokamax_test.py',
-              'autotuning_api_test': 'tokamax/_src/autotuning/api_test.py',
-              'tokamax_catchall': (
-                  '--ignore=tokamax/_src/ops/attention/base_test.py '
-                  '--ignore=tokamax/_src/ops/attention/api_test.py '
-                  '--ignore=tokamax/_src/ops/attention/pallas_mosaic_gpu_test.py '
-                  '--ignore=tokamax/_src/ops/attention/pallas_mosaic_tpu_test.py '
-                  '--ignore=tokamax/_src/ops/attention/pallas_triton_test.py '
-                  '--ignore=tokamax/_src/ops/attention/jax_nn_test.py '
-                  '--ignore=tokamax/_src/ops/attention/xla_chunked_test.py '
-                  '--ignore=tokamax/_src/ops/op_test.py '
-                  '--ignore=tokamax/_src/ops/ragged_dot/ '
-                  '--ignore=tokamax/_src/ops/triangle_multiplication/ '
-                  '--ignore=tokamax/_src/ops/ragged_gather/ '
-                  '--ignore=tokamax/_src/ops/ragged_gather_reduce/ '
-                  '--ignore=tokamax/_src/ops/linear_softmax_cross_entropy_loss/ '
-                  '--ignore=tokamax/_src/ops/experimental/ '
-                  '--ignore=tokamax/_src/ops/flex_attention/ '
-                  '--ignore=tokamax/_src/ops/ragged_scatter/ '
-                  '--ignore=tokamax/_src/ops/gated_linear_unit/ '
-                  '--ignore=tokamax/_src/ops/normalization/ '
-                  '--ignore-glob="tokamax/_src/benchmarking_test*" '
-                  '--ignore=tokamax/_src/autotuning/api_test.py '
-                  'tokamax/_src'
-              ),
-          }
+      - name: Warn about unsharded test files
+        # Fails the run if a shard's targets have been renamed away, if a file
+        # split by node ID grows a class no shard names, or if a shard's paths
+        # are not test files. Stdlib only, so no install needed.
+        if: steps.compute.outputs.catch_all != '[]'
+        env:
+          CATCH_ALL: ${{ steps.compute.outputs.catch_all }}
+        run: |
+          echo "::warning::Test files belong to no shard and ran in the" \
+               "catch-all job: ${CATCH_ALL}. Give each one a shard in" \
+               ".github/ci/shards.py; the catch-all job's --durations say" \
+               "which shard has room."
 
-          RUNNER_DEVICE = {
-              'linux-x86-a3-8g-h100-1gpu': 'cuda',
-              'linux-x86-ct6e-44-1tpu': 'tpu',
-              'linux-x86-tpu7x-56-1tpu': 'tpu',
-          }
+      - name: List the shards
+        # Log only, so that one can still see it, but not as an authoritative
+        # run summary including timing data - that is done after the job ends.
+        run: python3 .github/ci/shards.py list
 
-          # Short display name only; runs-on still uses the full runner label above.
-          RUNNER_SHORT = {
-              'linux-x86-a3-8g-h100-1gpu': 'h100',
-              'linux-x86-ct6e-44-1tpu': 'tpu6e',
-              'linux-x86-tpu7x-56-1tpu': 'tpu7x',
-          }
+      - name: Explain the selection
+        # Each shard the change reaches, and which of that shard's test files
+        # it reached. Log only: the decision was made in `Build test matrix`
+        # above, and this is the detail behind it for anyone asking why a
+        # shard did or did not run. Gated on the same `-f` test that step
+        # uses, rather than on a step output saying the same thing twice.
+        continue-on-error: true
+        run: |
+          if [[ -f /tmp/changed ]]; then
+            python3 .github/ci/shards.py explain --changed-from /tmp/changed
+          fi
 
-          selected = set(SHARD_TEST_PATHS)
+  collect-tests:
+    # Whole-tree collection, deliberately unsharded and never narrowed.
+    needs: shard-matrix
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Tokamax
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
-          combos = [
-              {
-                  'runner': runner,
-                  'runner_short': RUNNER_SHORT[runner],
-                  'device': device,
-                  'shard_name': shard,
-                  'test_paths': SHARD_TEST_PATHS[shard],
-              }
-              for runner, device in RUNNER_DEVICE.items()
-              for shard in sorted(selected)
-          ]
+      - name: Install Python 3.12
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c  # v6.0.0
+        with:
+          python-version: 3.12
 
-          print(f"include={json.dumps(combos)}")
-          PYEOF
+      - name: Install dependencies
+        # No device extra: nothing here executes a kernel.  JAX is pinned to
+        # the latest version that was installed in CI.
+        run: |
+          JAX_PIN=$(python -c 'import sys; sys.path.insert(0, ".github/ci"); import shards; print(shards.latest_jax())')
+          echo "Installing dependencies on cpu, jax ${JAX_PIN}"
+          # No need to put `jaxlib` in the constraint file: jax's own metadata
+          # pins it from there.
+          printf 'jax==%s\n' "${JAX_PIN}" > /tmp/jax-pin.txt
+          python -m pip install --upgrade pip
+          python -m pip install --constraint /tmp/jax-pin.txt -e ".[test]"
+          python -m pip freeze
+          got=$(python -c 'import jax; print(jax.__version__)')
+          [[ "${got}" == "${JAX_PIN}" ]] || {
+            echo "::error::asked for jax ${JAX_PIN}, got ${got}"; exit 1; }
 
-  ops-tests:
-    name: ops-tests (${{ matrix.runner_short }}, ${{ matrix.shard_name }})
-    needs: build-matrix
+      - name: Collect every test
+        env:
+          PYTEST_FLAGS: ${{ needs.shard-matrix.outputs.pytest_flags }}
+        run: |
+          # `--collect-only` imports every test module and reports what it
+          # found without running any of it.
+          printf '%s tokamax' "${PYTEST_FLAGS}" \
+            | xargs pytest --collect-only -q
+
+  shard-tests:
+    # This is an if statement: if `matrix.shard_name` doesn't exist, the `name` is changed to be the 
+    # readable `shard-tests (no shard selected)`, rather than the raw template.
+    name: ${{ matrix.shard_name && format('shard-tests ({0}, {1})', matrix.runner_short, matrix.shard_name) || 'shard-tests (no shard selected)' }}
+    needs: shard-matrix
+    # A change that reaches no test -- documentation, a benchmark script --
+    # selects no shard, and a matrix with an empty `include` is not a job with
+    # nothing to do, it is a configuration error. `Check results` knows this
+    # skip is legitimate and passes the run.
+    if: needs.shard-matrix.outputs.include != '[]'
     strategy:
+      fail-fast: true
       matrix:
-        include: ${{ fromJson(needs.build-matrix.outputs.include) }}
+        include: ${{ fromJson(needs.shard-matrix.outputs.include) }}
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -173,13 +225,89 @@ jobs:
           persist-credentials: false
 
       - name: Install dependencies
+        env:
+          DEVICE: ${{ matrix.device }}
+          JAX_PIN: ${{ matrix.jax_pin }}
         run: |
-          echo "Installing dependencies on device ${{ matrix.device }}"
+          echo "Installing dependencies on device ${DEVICE}, jax ${JAX_PIN}"
+          # No need to put `jax[tpu]` or `jaxlib` in the constraint file.
+          # `jax==` bounds `jax[tpu]` too, and jax's own metadata pins jaxlib
+          # (unconditionally), libtpu and the CUDA plugin from there.
+          printf 'jax==%s\n' "${JAX_PIN}" > /tmp/jax-pin.txt
           python3.12 -m uv pip install --upgrade pip
           python3.12 -m uv pip --version
-          python3.12 -m uv pip install -e .[${{ matrix.device }},test]
+          python3.12 -m uv pip install --constraint /tmp/jax-pin.txt -e ".[${DEVICE},test]"
           python3.12 -m uv pip freeze
-      - name: Test Tokamax ops with unittest
-        # TODO: Disable benchmarking tests for presubmit until container is fixed
+          got=$(python3.12 -c 'import jax; print(jax.__version__)')
+          [[ "${got}" == "${JAX_PIN}" ]] || {
+            echo "::error::asked for jax ${JAX_PIN}, got ${got}"; exit 1; }
+
+      - name: Run shard
+        env:
+          # Read through `env:` rather than as interpolated text.
+          PYTEST_FLAGS: ${{ needs.shard-matrix.outputs.pytest_flags }}
+          TEST_PATHS: ${{ matrix.test_paths }}
         run: |
-          pytest -s -m "not long" --ignore-glob="*/test_base.py" ${{ matrix.test_paths }}
+          # Which tests run is decided by `pytest_flags` plus this shard's
+          # paths, both from .github/ci/shards.py. `-s` and `--durations` are
+          # reporting only: --durations lists the slowest tests in each shard,
+          # which is what to rebalance the SHARDS table against.
+          # Use xargs to split the flags and paths into separate arguments.
+          printf '%s %s' "${PYTEST_FLAGS}" "${TEST_PATHS}" \
+            | xargs -r pytest -s --durations=25
+
+  shard-all-tests-passed:
+    # The idea here is that rather than checking for specific shard names to pass, we centralize
+    # the bookkeeping here, and then Copybara checks that this "result-aggregating" job passed.
+    name: shard-all-tests-passed
+    needs: [shard-matrix, collect-tests, shard-tests]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Summarise results and timings
+        # Every shard's result and wall clock, in the run summary.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOBS: repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs
+        run: |
+          # `gh` holds the token and this stays testable without one. `--jq`
+          # emits one job per line. `filter=latest` is the jobs endpoint's
+          # default, named here because it is load-bearing: `all` would return
+          # a re-run's earlier attempts too, and a shard would be reported
+          # twice, once with whatever it did the first time.
+          gh api --paginate "${JOBS}?per_page=100&filter=latest" \
+            --jq '.jobs[]' > /tmp/jobs.jsonl
+          python3 .github/ci/summary.py < /tmp/jobs.jsonl >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Check results
+        env:
+          MATRIX: ${{ needs.shard-matrix.result }}
+          COLLECT: ${{ needs.collect-tests.result }}
+          TESTS: ${{ needs.shard-tests.result }}
+          INCLUDE: ${{ needs.shard-matrix.outputs.include }}
+        run: |
+          echo "shard-matrix=${MATRIX} collect=${COLLECT} tests=${TESTS}"
+          # Only `success` counts. `cancelled` in particular is not a result,
+          # and treating it as one is how a cancelled run reports green.
+          if [[ "${MATRIX}" != "success" ]]; then
+            echo "::error::shard-matrix did not succeed"
+            exit 1
+          fi
+          if [[ "${COLLECT}" != "success" ]]; then
+            echo "::error::collect-tests reported ${COLLECT}"
+            exit 1
+          fi
+          # `skipped` is expected when the change only touches non-test files
+          # (e.g. documentation or non-code files) and no shards are selected.
+          if [[ "${TESTS}" == "skipped" && "${INCLUDE}" == "[]" ]]; then
+            echo "This change reaches no test; no shard was selected."
+            exit 0
+          fi
+          if [[ "${TESTS}" != "success" ]]; then
+            echo "::error::tests reported ${TESTS}"
+            exit 1
+          fi

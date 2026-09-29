@@ -84,10 +84,22 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
       b_dim: int,
       h_dim: int,
       v_dim: int,
-      dtype: jnp.dtype = jnp.float32,
+      dtype: jnp.dtype = jnp.float32,  # pyrefly: ignore[bad-function-definition]
       vmem_limit_bytes: int | None = None,
   ) -> Config:
     return kernel.get_heuristic_fwd_config(
+        b_dim, h_dim, v_dim, dtype=dtype, vmem_limit_bytes=vmem_limit_bytes
+    )
+
+  @staticmethod
+  def get_heuristic_bwd_config(
+      b_dim: int,
+      h_dim: int,
+      v_dim: int,
+      dtype: jnp.dtype = jnp.float32,  # pyrefly: ignore[bad-function-definition]
+      vmem_limit_bytes: int | None = None,
+  ) -> Config:
+    return kernel.get_heuristic_bwd_config(
         b_dim, h_dim, v_dim, dtype=dtype, vmem_limit_bytes=vmem_limit_bytes
     )
 
@@ -183,7 +195,7 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
       b_dim: int,
       h_dim: int,
       v_dim: int,
-      dtype: jnp.dtype = jnp.float32,
+      dtype: jnp.dtype = jnp.float32,  # pyrefly: ignore[bad-function-definition]
       vmem_limit_bytes: int | None = None,
   ) -> Config:
     return kernel.get_heuristic_bwd_config(
