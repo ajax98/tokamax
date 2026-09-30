@@ -98,12 +98,51 @@ class _FakeOp(op_lib.Op[Any, jax.Array, None, _FakeOpConfig, Any]):
     return {_AUTOTUNE_CONFIG}
 
 
+class _DeviceRestrictedOp(_FakeOp):
+
+  def supported_on(self, device: jax.Device) -> bool:
+    del device
+    return False
+
+
 class OpTest(parameterized.TestCase):
 
   def test_bind(self):
     x = jnp.zeros((1, 2))
     y = jnp.ones((1, 2))
     self.assertEqual(_FakeOp().bind(x, y).args, (x, y))
+
+  def test_snake_case_name(self):
+    self.assertEqual(
+        op_lib.snake_case_name(norm_base.Normalization()), "normalization"
+    )
+    self.assertEqual(
+        op_lib.snake_case_name(ragged_dot_base.RaggedDot()), "ragged_dot"
+    )
+    self.assertEqual(
+        op_lib.snake_case_name(pl_ragged_dot.PallasTritonRaggedDot()),
+        "pallas_triton_ragged_dot",
+    )
+    self.assertEqual(op_lib.snake_case_name(_FakeOp()), "__fake_op")
+
+  def test_device_restriction_raises_on_unsupported_device(self):
+    x = jnp.zeros((1, 2))
+    y = jnp.ones((1, 2))
+    with self.assertRaisesRegex(NotImplementedError, "Not supported on"):
+      _DeviceRestrictedOp()(x, y)
+
+  def test_bypass_device_check_bypasses_device_restriction(self):
+    x = jnp.zeros((1, 2))
+    y = jnp.ones((1, 2))
+    out = _DeviceRestrictedOp().replace(bypass_device_check=True)(x, y)
+    self.assertTrue(jnp.array_equal(out, x + y))
+
+  def test_cross_compile_config_bypasses_device_restriction(self):
+    x = jnp.zeros((1, 2))
+    y = jnp.ones((1, 2))
+    with config_lib.cross_compile(True):
+      out = _DeviceRestrictedOp()(x, y)
+    self.assertTrue(jnp.array_equal(out, x + y))
 
 
 class BoundArgumentsTest(parameterized.TestCase):
@@ -144,6 +183,31 @@ class BoundArgumentsTest(parameterized.TestCase):
     with config_lib.autotuning_cache_miss_fallback("error"):
       with self.assertRaisesRegex(ValueError, "No config found"):
         _ = ba.default_config
+
+  def test_cached_autotuning_data_cross_compile(self):
+    op = _FakeOp()
+    data = op_lib.AutotuningData({})
+    x = jnp.zeros((1, 2))
+    y = jnp.ones((1, 2))
+    ba = op.bind(x, y)
+    target_device = "mock_tpu"
+    op.get_autotuning_cache(target_device)[ba.autotuning_cache_key] = data
+
+    abstract_mesh = jax.sharding.AbstractMesh(
+        (),
+        (),
+        (),
+        abstract_device=jax.sharding.AbstractDevice(target_device, 1, "tpu"),
+    )
+    with jax.sharding.use_abstract_mesh(abstract_mesh):
+
+      def traced_fn(x, y):
+        ba_traced = op.bind(x, y)
+        self.assertEqual(op_lib.infer_device_kind(ba_traced), target_device)
+        self.assertIs(ba_traced.cached_autotuning_data, data)
+        return x + y
+
+      jax.jit(traced_fn)(x, y)
 
   def test_heuristics_config(self):
     ba = _FakeOp().bind(jnp.zeros((1, 2)), jnp.ones((1, 2)))

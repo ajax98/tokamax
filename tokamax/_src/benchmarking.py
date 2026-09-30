@@ -137,7 +137,7 @@ class XprofProfileSession(contextlib.AbstractContextManager):
 
     self._profile = None
     self._xprof_session = None
-    self._hermetic = hermetic
+    self._hermetic: bool = hermetic
     self.xprof_url: str | None = None
     self._jax_profiler_mode = use_jax_profiler
     if xprof_session is None or profile_data is None:
@@ -149,6 +149,17 @@ class XprofProfileSession(contextlib.AbstractContextManager):
     self._xprof_session_kwargs = xprof_session_kwargs
     self._retain_artifacts = False
     self._timing_summary: dict[str, Any] | None = None
+
+    options = jax.profiler.ProfileOptions()
+    options.python_tracer_level = 0
+    options.host_tracer_level = 0
+    options.enable_hlo_proto = False
+    if jax.default_backend() == 'tpu':
+      options.advanced_configuration = {
+          'tpu_trace_mode': 'TRACE_ONLY_XLA',
+          'tpu_perf_counters': True,
+      }
+    self._profiler_options = options
 
   @property
   def total_op_time(self) -> datetime.timedelta:
@@ -207,7 +218,10 @@ class XprofProfileSession(contextlib.AbstractContextManager):
         # get profiling wallclock time right before the profiling starts
         self._profiler_wallclock_start_time = time.perf_counter()
         self._profiler_wallclock_time = None
-        jax.profiler.start_trace(self._profile_tempdir)
+
+        jax.profiler.start_trace(
+            self._profile_tempdir, profiler_options=self._profiler_options
+        )
         logger.info('Writing JAX profiler trace to: %s', self._profile_tempdir)
       except Exception as e:
         raise RuntimeError('Unable to start jax profiling session.') from e
@@ -219,10 +233,17 @@ class XprofProfileSession(contextlib.AbstractContextManager):
         # get profiling wallclock time right before the profiling starts
         self._profiler_wallclock_start_time = time.perf_counter()
         self._profiler_wallclock_time = None
-        self._xprof_session.start_session(
+
+        fast_kwargs = dict(
             enable_python_tracer=False,
-            host_trace_level=2,
+            host_trace_level=0,
             perf_counters=False,
+        )
+        # If not hermetic, users will generally want as much profiling data in
+        # the resulting XProf session as possible.
+        session_kwargs = fast_kwargs if self._hermetic else {}
+        self._xprof_session.start_session(
+            **session_kwargs,
             **self._xprof_session_kwargs,
         )
       except Exception as e:
@@ -251,8 +272,10 @@ class XprofProfileSession(contextlib.AbstractContextManager):
       self._profile = jax.profiler.ProfileData.from_serialized_xspace(
           profile_path.read_bytes()
       )
-      if (not self._retain_artifacts
-          or WORKLOAD_ARTIFACTS_DIR_VARNAME not in os.environ):
+      if (
+          not self._retain_artifacts
+          or WORKLOAD_ARTIFACTS_DIR_VARNAME not in os.environ
+      ):
         if self._profile_tempdir is not None and self._profile_tempdir.exists():
           shutil.rmtree(self._profile_tempdir)
       logger.info('JAX profiler trace file written to: %s', profile_path)
@@ -297,7 +320,10 @@ class XprofProfileSession(contextlib.AbstractContextManager):
 
 
 _ARRAY_TYPES = (
-    jax.Array, numerics.ArrayInitializer, jax.ShapeDtypeStruct, np.ndarray
+    jax.Array,
+    numerics.ArrayInitializer,
+    jax.ShapeDtypeStruct,
+    np.ndarray,
 )
 
 
@@ -436,12 +462,17 @@ def cupti_timer[T](f: Callable[[T], Any], args: T) -> Timer:
 
 
 def xprof_timer[T](
-    f: Callable[[T], Any], args: T, event_filter_regex: str | None = None
+    f: Callable[[T], Any],
+    args: T,
+    event_filter_regex: str | None = None,
+    use_jax_profiler: bool = False,
 ) -> Timer:
   def timer(return_metadata):
     jax.block_until_ready(f(args))  # Warmup.
     with XprofProfileSession(
-        hermetic=not return_metadata, event_filter_regex=event_filter_regex
+        hermetic=not return_metadata,
+        event_filter_regex=event_filter_regex,
+        use_jax_profiler=use_jax_profiler,
     ) as profile:
       jax.block_until_ready(f(args))
 
@@ -454,7 +485,12 @@ def xprof_timer[T](
 def hermetic_xprof_timer[T](
     f: Callable[[T], Any], args: T, event_filter_regex: str | None = None
 ) -> Timer:
-  timer = xprof_timer(f, args, event_filter_regex=event_filter_regex)
+  timer = xprof_timer(
+      f,
+      args,
+      event_filter_regex=event_filter_regex,
+      use_jax_profiler=True,
+  )
   return lambda _: timer(False)
 
 

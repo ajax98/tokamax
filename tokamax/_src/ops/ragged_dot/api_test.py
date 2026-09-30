@@ -18,12 +18,15 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import chex
 import jax
+from jax import export
 import jax.numpy as jnp
 import qwix
+from tokamax._src import config as config_lib
 from tokamax._src import gpu_utils
 from tokamax._src import hlo_utils
 from tokamax._src import quantization
 from tokamax._src.ops.ragged_dot import api
+from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import test_base
 
 
@@ -42,6 +45,15 @@ def relu(x):
   return jnp.maximum(x, 0)
 
 
+class _MockDeviceRestrictedOp(base.RaggedDot):
+
+  def __call__(self, *args, **kwargs):
+    del args, kwargs
+    if not self.bypass_device_check:
+      raise NotImplementedError("device check failed")
+    return jnp.zeros((128, 128))
+
+
 class RaggedDotTest(parameterized.TestCase):
 
   @parameterized.product(
@@ -52,6 +64,9 @@ class RaggedDotTest(parameterized.TestCase):
 
     if implementation == "triton" and not gpu_utils.has_triton_support():
       self.skipTest("Triton not supported on this platform.")
+
+    if implementation == "triton" and activation is not None and gpu_utils.is_sm90():
+      self.skipTest("Triton ragged_dot with activation VJP crashes on SM90.")
 
     # Current default backend if implementation is None is "mosaic".
     if implementation == "mosaic" or implementation is None:
@@ -149,6 +164,106 @@ class RaggedDotTest(parameterized.TestCase):
         manual_axis_type=None,
     )
 
+  def test_device_check_bypass_auto_vs_explicit(self):
+    if jax.default_backend() != "cpu":
+      self.skipTest("Device check bypass test specifically targets CPU.")
+
+    lhs, rhs, group_sizes = _get_input_data(num_experts=8, m=128, k=64, n=128)
+
+    # Case 1: implementation is None (auto-selection).
+    # On CPU, device restriction is enforced on hardware-specific backends,
+    # so auto-selection safely falls back to xla and succeeds.
+    out_auto = api.ragged_dot(lhs, rhs, group_sizes, implementation=None)
+    self.assertEqual(out_auto.shape, (128, 128))
+
+    # When explicitly forcing bypass_device_check=False on a TPU op on CPU,
+    # device validation raises NotImplementedError.
+    if "mosaic_tpu_v2" in api.IMPLEMENTATIONS:
+      with self.assertRaisesRegex(
+          NotImplementedError, "Not supported on cpu"
+      ):
+        api.ragged_dot(
+            lhs,
+            rhs,
+            group_sizes,
+            implementation="mosaic_tpu_v2",
+            bypass_device_check=False,
+        )
+
+    # Case 2: implementation is explicitly passed in.
+    # Device validation is automatically bypassed when implementation is
+    # manually specified.
+    mock_impl = _MockDeviceRestrictedOp()
+
+    # Explicit implementation bypasses device validation.
+    out_manual = api.ragged_dot(
+        lhs, rhs, group_sizes, implementation=[mock_impl]
+    )
+    self.assertEqual(out_manual.shape, (128, 128))
+
+    # Explicitly disabling bypass enforces device check and raises.
+    with self.assertRaisesRegex(NotImplementedError, "device check failed"):
+      api.ragged_dot(
+          lhs,
+          rhs,
+          group_sizes,
+          implementation=[mock_impl],
+          bypass_device_check=False,
+      )
+
+  def test_device_check_bypass_sequence_fallback(self):
+    if jax.default_backend() != "cpu":
+      self.skipTest("Device check bypass test specifically targets CPU.")
+
+    lhs, rhs, group_sizes = _get_input_data(num_experts=8, m=128, k=64, n=128)
+
+    mock_fail = _MockDeviceRestrictedOp()
+
+    # When passing a sequence of multiple candidates, device validation is
+    # enforced so failing candidate falls back to the next candidate ("xla").
+    out_fallback = api.ragged_dot(
+        lhs, rhs, group_sizes, implementation=[mock_fail, "xla"]
+    )
+    self.assertEqual(out_fallback.shape, (128, 128))
+
+  def test_cross_compile_export_on_cpu(self):
+    if jax.default_backend() != "cpu":
+      self.skipTest("Cross-compile export test specifically targets CPU.")
+
+    lhs, rhs, group_sizes = _get_input_data(num_experts=8, m=128, k=64, n=128)
+
+    if "mosaic_tpu_v2" in api.IMPLEMENTATIONS:
+      # Explicit implementation automatically bypasses device checks on CPU.
+      def dot_fn(lhs, rhs, group_sizes):
+        return api.ragged_dot(
+            lhs,
+            rhs,
+            group_sizes,
+            implementation="mosaic_tpu_v2",
+        )
+
+      # Lowering on CPU emits TPU custom calls.
+      lowered = jax.jit(dot_fn).lower(lhs, rhs, group_sizes)
+      self.assertIn("custom_call", lowered.as_text("stablehlo"))
+
+      # StableHLO export on CPU succeeds with custom call check disabled.
+      exported = export.export(
+          dot_fn,  # pyrefly: ignore[bad-argument-type]
+          disabled_checks=[
+              export.DisabledSafetyCheck.custom_call("tpu_custom_call")
+          ],
+      )(
+          jax.ShapeDtypeStruct(lhs.shape, lhs.dtype),
+          jax.ShapeDtypeStruct(rhs.shape, rhs.dtype),
+          jax.ShapeDtypeStruct(group_sizes.shape, group_sizes.dtype),
+      )
+      self.assertIsNotNone(exported)
+
+      # Cross-compile config globally bypasses device checks.
+      with config_lib.cross_compile(True):
+        lowered_cfg = jax.jit(dot_fn).lower(lhs, rhs, group_sizes)
+        self.assertIn("custom_call", lowered_cfg.as_text("stablehlo"))
+
 
 class RaggedDotImplementationTest(test_base.RaggedDotTestBase):
 
@@ -235,6 +350,19 @@ class RaggedDotXlaTest(RaggedDotImplementationTest):
 
   def __init__(self, *args):
     super().__init__(*args, implementation="xla")
+
+  def _test_quantized(self, *args, **kwargs):
+    if jax.default_backend() == "gpu":
+      self.skipTest("Quantized ragged_dot not supported on GPU for XLA.")
+    super()._test_quantized(*args, **kwargs)
+
+  def _test_bench(self, spec):
+    if jax.default_backend() == "gpu" and (
+        isinstance(spec.get("lhs"), qwix.QArray)
+        or isinstance(spec.get("rhs"), qwix.QArray)
+    ):
+      self.skipTest("Quantized ragged_dot not supported on GPU for XLA.")
+    super()._test_bench(spec)
 
 
 if __name__ == "__main__":

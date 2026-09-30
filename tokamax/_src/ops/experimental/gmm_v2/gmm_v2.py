@@ -15,6 +15,7 @@
 from abc import ABC, abstractmethod
 import dataclasses
 import functools
+import math
 from typing import Any, Callable, Tuple
 
 import jax
@@ -22,6 +23,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from tokamax._src import config
 
 # Util.
 
@@ -46,6 +48,15 @@ def silu_and_mul_with_clamp(
   gate = jnp.clip(gate, max=limit)
   up = jnp.clip(up, min=-limit, max=limit)
   return jax.nn.silu(gate) * up
+
+
+def situ_and_mul(
+    gate: jax.Array, up: jax.Array, beta: float, linear_beta: float | None
+) -> jax.Array:
+  gate = beta * jnp.tanh(gate / beta) * jax.nn.sigmoid(gate)
+  if linear_beta is not None:
+    up = linear_beta * jnp.tanh(up / linear_beta)
+  return gate * up
 
 
 def interleave_lane(lhs: jax.Array, rhs: jax.Array) -> jax.Array:
@@ -104,12 +115,39 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None):
       return swigluoai(acc_gate, acc_up)
     case "silu_and_mul_with_clamp":
       return silu_and_mul_with_clamp(acc_gate, acc_up)
+    case str() if fuse_act.startswith("situ:"):
+      _, beta, linear_beta = fuse_act.split(":")
+      linear_beta = None if linear_beta == "none" else float(linear_beta)
+      return situ_and_mul(acc_gate, acc_up, float(beta), linear_beta)
     case _:
       raise NotImplementedError(f"Unsupported activation function: {fuse_act}")
 
 
 def align_to(x, a):
   return pl.cdiv(x, a) * a
+
+
+def _get_lhs_sublane_size(dtype: jnp.dtype, size_m: int) -> int:
+  """Sublane block size the kernel processes lhs rows in."""
+  size_lhs_sublane = pltpu.get_tpu_info().get_sublane_tiling(dtype)
+  size_lhs_sublane = min(size_lhs_sublane, size_m)
+  return size_lhs_sublane
+
+
+def get_packing_factor(
+    storage_dtype: jnp.dtype, quant_dtype: jnp.dtype | None
+) -> int:
+  if quant_dtype is None or quant_dtype == storage_dtype:
+    return 1
+  storage_bits = jax.dtypes.itemsize_bits(storage_dtype)
+  quant_bits = jax.dtypes.itemsize_bits(quant_dtype)
+  packing_factor, remainder = divmod(storage_bits, quant_bits)
+  if remainder != 0:
+    raise ValueError(
+        f"Storage dtype {storage_dtype} is not divisible by "
+        f"quant dtype {quant_dtype}"
+    )
+  return packing_factor
 
 
 # Define data classes.
@@ -239,6 +277,15 @@ class InputConfigs:
   # (dtype == quant_dtype) the scale dequantizes it (rhs); when it arrives
   # unquantized (dtype != quant_dtype) the scale quantizes it online (lhs).
   has_scale: bool = False
+  is_transposed: bool = False
+
+  @property
+  def should_unpack(self) -> bool:
+    """True if rhs weights are sub-byte (e.g.
+
+    INT4) packed in INT32/UINT32 carriers.
+    """
+    return get_packing_factor(self.dtype, self.quant_dtype) > 1
 
   @property
   def should_use_external_scale(self) -> bool:
@@ -477,15 +524,17 @@ def inner_kernel(
     mxu_size = tpu_info.mxu_column_size
 
     # Step 1: Input pre-processing.
-    tiled_lhs = tiled_lhs_ref.get_value().reshape(-1, cfgs.tiles.tile_k)[:bucket_m]
+    tiled_lhs = tiled_lhs_ref.get_value().reshape(-1, cfgs.tiles.tile_k)[
+        :bucket_m
+    ]
     tiled_rhs = tiled_rhs_ref.get_weight()
+    if cfgs.transpose_rhs:
+      tiled_rhs = jnp.transpose(tiled_rhs)
 
     # This should only be taken in the case where we don't requantize
     # the scales and thus we need to dequantize inside VMEM to avoid small
     # contracting dimmensions
-    rhs_tile_n = (
-        tiled_rhs.shape[0] if cfgs.transpose_rhs else tiled_rhs.shape[1]
-    )
+    rhs_tile_n = tiled_rhs.shape[1]
     rhs_qbs = cfgs.rhs_cfgs.quant_block_size
     if cfgs.rhs_cfgs.should_dequantize_before_matmul:
       if cfgs.transpose_rhs:
@@ -506,10 +555,12 @@ def inner_kernel(
 
     valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
     if is_last_k_step and valid_k != 0:
-      if cfgs.transpose_rhs:
-        mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 1) < valid_k
-      else:
-        mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 0) < valid_k
+      # `lhs` needs to be masked over k-axis iff `lhs` contains `jnp.nan`s
+      # Otherwise, only masking `rhs` to zeros is sufficient.
+      mask_lhs = lax.broadcasted_iota(jnp.int32, tiled_lhs.shape, 1) < valid_k
+      tiled_lhs = jnp.where(mask_lhs, tiled_lhs, 0)
+
+      mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 0) < valid_k
       tiled_rhs = jnp.where(mask_rhs, tiled_rhs, 0)
 
     # Step 2: Matmul.
@@ -524,18 +575,11 @@ def inner_kernel(
         for start_k in range(0, cfgs.tiles.tile_k, rhs_qbs):  # pyrefly: ignore[bad-argument-type]
           end_k = min(cfgs.tiles.tile_k, start_k + rhs_qbs)  # pyrefly: ignore[unsupported-operation]
 
-          if cfgs.transpose_rhs:
-            block_acc = jnp.matmul(
-                tiled_lhs[:, start_k:end_k],
-                tiled_rhs[start_n:end_n, start_k:end_k].T,
-                preferred_element_type=jnp.float32,
-            ).astype(acc_ref.dtype)
-          else:
-            block_acc = jnp.matmul(
-                tiled_lhs[:, start_k:end_k],
-                tiled_rhs[start_k:end_k, start_n:end_n],
-                preferred_element_type=jnp.float32,
-            ).astype(acc_ref.dtype)
+          block_acc = jnp.matmul(
+              tiled_lhs[:, start_k:end_k],
+              tiled_rhs[start_k:end_k, start_n:end_n],
+              preferred_element_type=jnp.float32,
+          ).astype(acc_ref.dtype)
 
           if cfgs.rhs_cfgs.should_dequantize_after_matmul:
             if cfgs.transpose_rhs:
@@ -570,6 +614,13 @@ def inner_kernel(
       if should_use_external_scale:
         lhs_scale = tiled_lhs_ref.get_scale().astype(acc_ref.dtype)
         lhs_scale_inv = 1.0 / lhs_scale
+      # With a k-invariant lhs scale, sub-block results accumulate directly
+      # into acc_n and the scale is applied once after the k loop.
+      ext_lhs_scale_const_k = (
+          should_use_external_scale
+          and lhs_scale is not None
+          and lhs_scale.shape[-1] == 1
+      )
 
       # Without n outer loop, result of quantized matmul becomes available only
       # at the last iteration of the loop. This means [tile_m, tile_n] value
@@ -577,6 +628,11 @@ def inner_kernel(
       # result of [tile_m, mxu_size] becomes available at the end of every k
       # inner loop which can be used to pipeline subsequent VPU or VST ops with
       # MXU ops for the next [tile_m, mxu_size].
+      step_k = (
+          math.gcd(q_block_size, rhs_qbs)  # pyrefly: ignore[bad-argument-type]
+          if cfgs.rhs_cfgs.should_dequantize_after_matmul
+          else q_block_size
+      )
       for start_n in range(0, rhs_tile_n, mxu_size):
         end_n = min(rhs_tile_n, start_n + mxu_size)
         col_size = end_n - start_n
@@ -586,10 +642,7 @@ def inner_kernel(
           end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)  # pyrefly: ignore[unsupported-operation]
 
           block_lhs = tiled_lhs[:, start_k:end_k]
-          if cfgs.transpose_rhs:
-            block_rhs = tiled_rhs[start_n:end_n, start_k:end_k]
-          else:
-            block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
+          block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
 
           # Perform lhs quantization. Note that for every block_lhs,
           # same computation will be performed tiles_n//mxu_size times.
@@ -618,43 +671,49 @@ def inner_kernel(
           if not tpu_info.is_matmul_supported(lhs_q_dtype, block_rhs.dtype):
             block_rhs = block_rhs.astype(lhs_q_dtype)
 
-          if cfgs.transpose_rhs:
-            block_acc = jnp.matmul(
-                block_lhs_q,
-                block_rhs.T,
+          block_len = end_k - start_k
+          # Initialize to None rather than jnp.zeros to avoid emitting an extra
+          # VPU add instruction on the first sub-block in Pallas/Mosaic lowering
+          block_acc = acc_n if ext_lhs_scale_const_k else None
+          for sub_k in range(0, block_len, step_k):  # pyrefly: ignore[bad-argument-type]
+            sub_end_k = min(block_len, sub_k + step_k)  # pyrefly: ignore[unsupported-operation]
+            sub_acc = jnp.matmul(
+                block_lhs_q[:, sub_k:sub_end_k],
+                block_rhs[sub_k:sub_end_k, :],
                 preferred_element_type=preferred_element_type,
             ).astype(acc_ref.dtype)
+
+            # Apply rhs subchannel scale per quant block.
+            if cfgs.rhs_cfgs.should_dequantize_after_matmul:
+              if cfgs.transpose_rhs:
+                raise NotImplementedError(
+                    "should_dequantize_after_matmul is not supported with"
+                    " transpose_rhs."
+                )
+              b_id = (start_k + sub_k) // rhs_qbs  # pyrefly: ignore[unsupported-operation]
+              rhs_scale_replicated = tiled_rhs_ref.get_scale(
+                  replicate_size=bucket_m
+              )[b_id, :, start_n : start_n + col_size]
+              sub_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
+
+            block_acc = sub_acc if block_acc is None else block_acc + sub_acc
+
+          assert block_acc is not None
+          if ext_lhs_scale_const_k:
+            acc_n = block_acc
           else:
-            block_acc = jnp.matmul(
-                block_lhs_q,
-                block_rhs,
-                preferred_element_type=preferred_element_type,
-            ).astype(acc_ref.dtype)
-
-          block_acc *= block_scale.astype(acc_ref.dtype)
-
-          # Apply rhs subchannel scale per quant block.
-          if cfgs.rhs_cfgs.should_dequantize_after_matmul:
-            if cfgs.transpose_rhs:
-              raise NotImplementedError(
-                  "should_dequantize_after_matmul is not supported with"
-                  " transpose_rhs."
-              )
-            b_id = start_k // rhs_qbs  # pyrefly: ignore[unsupported-operation]
-            rhs_scale_replicated = tiled_rhs_ref.get_scale(
-                replicate_size=bucket_m
-            )[b_id, :, start_n : start_n + col_size]
-            block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
-
-          acc_n += block_acc
+            block_acc *= block_scale.astype(acc_ref.dtype)
+            acc_n += block_acc
+        if ext_lhs_scale_const_k:
+          assert lhs_scale is not None
+          acc_n *= lhs_scale
         acc_list.append(acc_n)
 
     acc = jnp.concatenate(acc_list, axis=1)
 
     # Step 3: Output post-processing.
     if not is_first_k_step:
-      acc = jnp.pad(acc, ((cfgs.tiles.tile_m - bucket_m, 0), (0, 0)))
-      acc += acc_ref[...]
+      acc += acc_ref[:bucket_m]
     acc_m = acc.shape[0]
 
     if is_last_k_step:
@@ -726,15 +785,11 @@ def inner_kernel(
     is_first_k_step = k_id == 0
     is_last_k_step = k_id == (num_k - 1)
 
-    if bucket_m == cfgs.tiles.tile_m:
-      lax.cond(
-          is_first_k_step,
-          lambda: lax.cond(is_last_k_step, matmul_first_last, matmul_first),
-          lambda: lax.cond(is_last_k_step, matmul_last, matmul_mid),
-      )
-    else:
-      # partial m is only invoked at last matmul.
-      lax.cond(is_first_k_step, matmul_first_last, matmul_last)
+    lax.cond(
+        is_first_k_step,
+        lambda: lax.cond(is_last_k_step, matmul_first_last, matmul_first),
+        lambda: lax.cond(is_last_k_step, matmul_last, matmul_mid),
+    )
 
   branches = []
   for bucket_idx in range(cfgs.tiles.tile_m // cfgs.tiles.bucket_base):
@@ -956,6 +1011,10 @@ def kernel_main(
   num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
   num_n = pl.cdiv(cfgs.out_size_n, cfgs.tiles.tile_n)
 
+  if cfgs.rhs_cfgs.should_unpack:
+    rhs_weight = rhs_ref.weight.bitcast(cfgs.rhs_cfgs.quant_dtype)
+    rhs_ref = dataclasses.replace(rhs_ref, weight=rhs_weight)
+
   # Fill metadata buffer and return number of group & m interations.
   num_gm = fill_metadata(
       lhs_group_sizes_ref,
@@ -987,13 +1046,22 @@ def kernel_main(
 
   # Partition output tiles across TCs in MegaCore mode over both parallel
   # dimensions.
+  # TODO: Revert temporary fallback to unblock vmap on older JAX.
+  # DO NOT EDIT THIS BLOCK: This path is a temporary fallback to unblock
+  # until Tokamax updates its JAX version.
+  core_axis_name = None if config.disable_multi_core_mode.value else "core"
+  dimension_semantics = (
+      None
+      if config.disable_multi_core_mode.value
+      else (pltpu.PARALLEL, pltpu.ARBITRARY, pltpu.ARBITRARY)
+  )
   pipeline_fn = pltpu.emit_pipeline(
       functools.partial(inner_kernel, cfgs=cfgs),
       grid=(num_n, num_gm, num_k),
       in_specs=(lhs_spec, rhs_spec),
       out_specs=out_spec,
-      core_axis_name="core",
-      dimension_semantics=(pltpu.PARALLEL, pltpu.ARBITRARY, pltpu.ARBITRARY),
+      core_axis_name=core_axis_name,
+      dimension_semantics=dimension_semantics,
   )
 
   # Bounded slice requires second last dim to be aligned to the sublane size.
@@ -1021,7 +1089,7 @@ def calculate_tiling(
   """Calculate optimal tile sizes for GMM kernel."""
 
   lhs_dtype = lhs_cfgs.dtype
-  rhs_dtype = rhs_cfgs.dtype
+  rhs_dtype = rhs_cfgs.quant_dtype or rhs_cfgs.dtype
 
   lhs_bits = jax.dtypes.itemsize_bits(lhs_dtype)
   rhs_bits = jax.dtypes.itemsize_bits(rhs_dtype)
@@ -1030,7 +1098,7 @@ def calculate_tiling(
   # safe to use for most scenarios. But if lower bitwidth is used, we need
   # to tweak tile_m to account for using faster hardware unit.
   # TODO: Account for different TPU hardware specs.
-  bf16_bf16_tile_m = 128
+  bf16_bf16_tile_m = 256 if rhs_cfgs.is_transposed else 128
   rhs_mod = min(pl.cdiv(16, rhs_bits), 2)
   tile_m = bf16_bf16_tile_m // rhs_mod
   if lhs_cfgs.should_quantize:
@@ -1124,8 +1192,11 @@ def calculate_tiling(
       num_k_tiles += 1
       tile_k = align_to(dims.size_k, num_k_tiles * num_lanes) // num_k_tiles
 
-  if (rhs_cfgs.has_scale and rhs_cfgs.quant_block_size is not None
-      and not _is_tile_k_quant_block_compatible(tile_k)):
+  if (
+      rhs_cfgs.has_scale
+      and rhs_cfgs.quant_block_size is not None
+      and not _is_tile_k_quant_block_compatible(tile_k)
+  ):
     tile_k = rhs_cfgs.quant_block_size
 
   if tile_n == 0 or tile_k == 0:
@@ -1178,6 +1249,7 @@ def validate_inputs(
     lhs_scale: jax.Array | None = None,
     transpose_rhs: bool = False,
     lhs_quant_dtype: jnp.dtype | None = None,
+    packing_factor: int = 1,
 ) -> Dimensions:
   """Validates the inputs for the GMM kernel."""
 
@@ -1186,6 +1258,7 @@ def validate_inputs(
     size_group, size_n, size_k = rhs.shape
   else:
     size_group, size_k, size_n = rhs.shape
+  size_k *= packing_factor
   size_lhs_group = group_sizes.shape[0]
 
   assert size_group <= size_lhs_group
@@ -1202,9 +1275,9 @@ def validate_inputs(
       )
     if fuse_act is not None:
       raise NotImplementedError("transpose_rhs does not support fuse_act.")
-    assert rhs.shape == (size_group, size_n, size_k)
+    assert rhs.shape == (size_group, size_n, size_k // packing_factor)
   else:
-    assert rhs.shape == (size_group, size_k, size_n)
+    assert rhs.shape == (size_group, size_k // packing_factor, size_n)
   if rhs_bias is not None:
     assert rhs_bias.shape == (size_group, 1, size_n)
   if rhs_scale is not None:
@@ -1216,9 +1289,7 @@ def validate_inputs(
     assert size_k % num_quant_blocks == 0
 
   if lhs_scale is not None:
-    assert maybe_quantize_lhs, (
-        "lhs_scale requires maybe_quantize_lhs=True."
-    )
+    assert maybe_quantize_lhs, "lhs_scale requires maybe_quantize_lhs=True."
     # Only per-tensor scales are supported for now. The current implementation
     # generalizes to per-channel [M, 1] and
     # sub-channel [M, num_k_blocks]; extend the validation and the block spec /
@@ -1244,8 +1315,7 @@ def validate_inputs(
           "are not a supported combination."
       )
 
-  size_lhs_sublane = pltpu.get_tpu_info().get_sublane_tiling(lhs.dtype)
-  size_lhs_sublane = min(size_lhs_sublane, size_m)
+  size_lhs_sublane = _get_lhs_sublane_size(lhs.dtype, size_m)
   if fuse_act is not None:
     num_lanes = pltpu.get_tpu_info().num_lanes
     if size_n % (2 * num_lanes) != 0:
@@ -1269,7 +1339,7 @@ def get_cost_estimate(cfgs: GmmConfigs):
 
   dims = cfgs.dims
   lhs_dtype = cfgs.lhs_cfgs.quant_dtype or cfgs.lhs_cfgs.dtype
-  rhs_dtype = cfgs.rhs_cfgs.dtype
+  rhs_dtype = cfgs.rhs_cfgs.quant_dtype or cfgs.rhs_cfgs.dtype
 
   # We use bits for rhs since it could sub-byte dtype like int4.
   rhs_bits = jax.dtypes.itemsize_bits(rhs_dtype)
@@ -1326,8 +1396,10 @@ def make_gmm_configs(
     lhs_scale: jax.Array | None = None,
     transpose_rhs: bool = False,
     lhs_quant_dtype: jnp.dtype | None = None,
+    rhs_quant_dtype: jnp.dtype | None = None,
 ):
   """Fills the GMM config for the GMM kernel."""
+  packing_factor = get_packing_factor(rhs.dtype, rhs_quant_dtype)
 
   dims = validate_inputs(
       lhs,
@@ -1341,16 +1413,16 @@ def make_gmm_configs(
       lhs_scale,
       transpose_rhs=transpose_rhs,
       lhs_quant_dtype=lhs_quant_dtype,
+      packing_factor=packing_factor,
   )
 
   if rhs_scale is not None:
     has_scale = True
-    rhs_quant_dtype = rhs.dtype
+    rhs_quant_dtype = rhs_quant_dtype or rhs.dtype
     num_blocks = rhs_scale.shape[1]
     block_size = dims.size_k // num_blocks
   else:
     has_scale = False
-    rhs_quant_dtype = None
     block_size = dims.size_k
 
   rhs_cfgs = InputConfigs(
@@ -1359,6 +1431,7 @@ def make_gmm_configs(
       dtype=rhs.dtype,
       has_bias=rhs_bias is not None,
       has_scale=has_scale,
+      is_transposed=transpose_rhs,
   )
 
   lhs_q_dtype = None
@@ -1453,6 +1526,7 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
         "acc_dtype",
         "maybe_quantize_lhs",
         "lhs_quant_dtype",
+        "rhs_quant_dtype",
         "zero_initialize",
         "fuse_act",
         "transpose_rhs",
@@ -1474,6 +1548,7 @@ def gmm_v2(
     acc_dtype: jnp.dtype | None = None,
     maybe_quantize_lhs: bool = True,
     lhs_quant_dtype: jnp.dtype | None = None,
+    rhs_quant_dtype: jnp.dtype | None = None,
     zero_initialize: bool = True,
     fuse_act: str | None = None,
     transpose_rhs: bool = False,
@@ -1487,7 +1562,8 @@ def gmm_v2(
   Args:
     lhs: lhs with shape [size_m, size_k].
     rhs: rhs with shape [size_group, size_k, size_n] (or [size_group, size_n,
-      size_k] if transpose_rhs).
+      size_k] if transpose_rhs) if native else [size_group, size_k // 8, size_n]
+      if packed.
     group_sizes: The group sizes of lhs rows of shape [size_lhs_group,].
     rhs_scale: The rhs scale of shape [size_group, num_blocks, 1, out_size].
     rhs_bias: The rhs bias of shape [size_group, 1, out_size].
@@ -1498,6 +1574,7 @@ def gmm_v2(
       quantized lhs uses the default dynamic per-block absmax calibration. Only
       takes effect when maybe_quantize_lhs is True and rhs is quantized.
     lhs_quant_dtype: Optional jnp.dtype to use for quantizing lhs
+    rhs_quant_dtype: Optional jnp.dtype to use for quantizing rhs
     tile_info: The tile sizes or tile function to use.
     vmem_limit_bytes: Optional vmem limit in bytes.
     precision: Unused. Exists for compatibility reasons.
@@ -1513,6 +1590,15 @@ def gmm_v2(
   """
 
   del precision
+
+  # The kernel reshapes lhs by its sublane block, so pad the rows up to it.
+  # The extra rows sit past every group, so they add no work, and they are
+  # sliced back off the output below.
+  size_m = lhs.shape[0]
+  size_lhs_sublane = _get_lhs_sublane_size(lhs.dtype, size_m)
+  padded_size_m = align_to(size_m, size_lhs_sublane)
+  if padded_size_m != size_m:
+    lhs = jnp.pad(lhs, ((0, padded_size_m - size_m), (0, 0)))
 
   if group_offset is None:
     group_offset = jnp.array([0], dtype=jnp.int32)
@@ -1540,6 +1626,7 @@ def gmm_v2(
       lhs_scale=lhs_scale,
       transpose_rhs=transpose_rhs,
       lhs_quant_dtype=lhs_quant_dtype,
+      rhs_quant_dtype=rhs_quant_dtype,
   )
   dims = cfgs.dims
   tiles = cfgs.tiles
@@ -1601,6 +1688,52 @@ def gmm_v2(
   out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
   lhs_in = LhsRef(value=lhs, scale=lhs_scale)
   rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
+
+  # TODO: Revert temporary fallback to unblock vmap on older JAX.
+  # DO NOT EDIT THIS BLOCK: This path is a temporary fallback to unblock
+  # until Tokamax updates its JAX version.
+  if config.disable_multi_core_mode.value:
+    lhs_scale_spec = None
+    if cfgs.lhs_cfgs.has_scale:
+      lhs_scale_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+
+    rhs_scale_spec = rhs_bias_spec = None
+    if rhs_scale is not None:
+      rhs_scale_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+    if rhs_bias is not None:
+      rhs_bias_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+
+    return pl.pallas_call(
+        functools.partial(kernel_main, cfgs=cfgs),
+        out_shape=out_init,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            in_specs=[
+                LhsRef(
+                    value=pl.BlockSpec(memory_space=pltpu.HBM),
+                    scale=lhs_scale_spec,
+                ),
+                WeightsRef(
+                    weight=pl.BlockSpec(memory_space=pltpu.HBM),
+                    scale=rhs_scale_spec,
+                    bias=rhs_bias_spec,
+                ),
+            ],
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            # pyrefly: ignore[bad-argument-type]
+            scratch_shapes=scratch_shapes,
+        ),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=vmem_limit_bytes,
+            disable_bounds_checks=True,
+        ),
+        name=get_scope_name(cfgs),
+        cost_estimate=get_cost_estimate(cfgs),
+        metadata=get_metadata(cfgs),  # pyrefly: ignore[bad-argument-type]
+    )(group_sizes, group_offset, lhs_in, rhs_weights)[
+        :size_m, : cfgs.out_size_n
+    ]
+
   group_sizes = pltpu.with_memory_space_constraint(group_sizes, pltpu.SMEM)
   group_offset = pltpu.with_memory_space_constraint(group_offset, pltpu.SMEM)
 
@@ -1617,4 +1750,4 @@ def gmm_v2(
       name=get_scope_name(cfgs),
       cost_estimate=get_cost_estimate(cfgs),
       metadata=get_metadata(cfgs),  # pyrefly: ignore[bad-argument-type]
-  )(group_sizes, group_offset, lhs_in, rhs_weights)[:, : cfgs.out_size_n]
+  )(group_sizes, group_offset, lhs_in, rhs_weights)[:size_m, : cfgs.out_size_n]

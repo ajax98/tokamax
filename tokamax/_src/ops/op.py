@@ -22,6 +22,7 @@ import contextvars
 import dataclasses
 import functools
 import inspect
+import re
 from typing import Any, ClassVar, Concatenate, Final, Literal, Self, cast, final, overload
 
 from absl import logging
@@ -52,6 +53,7 @@ class NullConfig:
 
 
 _NULL_CONFIG: Final[NullConfig] = NullConfig()
+_CAMEL_TO_SNAKE_PATTERN: Final[re.Pattern[str]] = re.compile(r"(?!^)([A-Z])")
 
 
 @jax.tree_util.register_dataclass
@@ -163,6 +165,7 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
 
   config: C | None = None
   _: dataclasses.KW_ONLY
+  bypass_device_check: bool = False
   # VJP function for the op. `vjp` will be passed the residuals and the output
   # of the op, the output gradients, then all arguments passed to the op.
   # The VJP function must return a tuple of gradients for each positional
@@ -194,7 +197,10 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
     ...
 
   def __call__(
-      self, *args: P.args, return_residuals: bool = False, **kwargs: P.kwargs  # pyrefly: ignore[bad-function-definition]
+      self,
+      *args: P.args,
+      return_residuals: bool = False,  # pyrefly: ignore[bad-function-definition]
+      **kwargs: P.kwargs,
   ) -> T | tuple[T, R]:
     """Applies the operation with the given arguments."""
 
@@ -206,9 +212,11 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
     bind = cast(Callable[P, Any], self.bind)  # Work around pytype bug.
     ba = bind(*args, **kwargs)
 
-    for device in infer_devices(ba) or {backend.get_default_device()}:
-      if not self.supported_on(device):
-        raise NotImplementedError(f"Not supported on {device.device_kind}.")
+    bypass = self.bypass_device_check or config_lib.cross_compile.value
+    if not bypass:
+      for device in infer_devices(ba) or {backend.get_default_device()}:
+        if not self.supported_on(device):
+          raise NotImplementedError(f"Not supported on {device.device_kind}.")
 
     args_flat, args_tree = jax.tree.flatten((ba.args, ba.kwargs))
     is_array = lambda x: isinstance(x, (jax.Array, np.ndarray))
@@ -404,6 +412,12 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
     return True
 
 
+def snake_case_name(op: Op) -> str:  # pylint: disable=g-bare-generic
+  """Returns the snake_case name of the op implementation."""
+  cls = op if isinstance(op, type) else type(op)
+  return _CAMEL_TO_SNAKE_PATTERN.sub(r"_\1", cls.__name__).lower()
+
+
 type AutotuningCache = dict[DeviceKind, dict[Any, AutotuningData[Any]]]
 
 _AUTOTUNING_CACHE: dict[Op, AutotuningCache] = {}  # pylint: disable=g-bare-generic
@@ -542,7 +556,7 @@ class BoundArguments[C, K: Hashable]:
         return data
 
     try:
-      return self.op.get_autotuning_cache()[key]
+      return self.op.get_autotuning_cache(device_kind)[key]
     except KeyError:
       key = cast(Mapping[str, Any], key)
       json_key_bytes = _get_arg_spec_adapter(self.op).dump_json(dict(key))
@@ -686,6 +700,10 @@ def infer_device_kind(ba: BoundArguments) -> DeviceKind | None:
   """Infers the device kind from bound array arguments."""
   device_kinds = {d.device_kind for d in infer_devices(ba)}
   if not device_kinds:
+    # Fall back to active abstract mesh during export or cross-compilation.
+    abstract_mesh = jax.sharding.get_abstract_mesh()
+    if abstract_mesh.abstract_device is not None:
+      return abstract_mesh.abstract_device.device_kind
     return None
   if len(device_kinds) == 1:
     return device_kinds.pop()
