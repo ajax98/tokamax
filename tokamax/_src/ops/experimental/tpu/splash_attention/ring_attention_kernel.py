@@ -112,7 +112,7 @@ def _ring_attention_forward(
       save_residuals=True,
       mask_value=mask_value,
       is_mqa=is_mqa,
-      config=config,
+      config=config,  # pyrefly: ignore[bad-argument-type]
       mask_function=mask_function,
       fwd_mask_sparsity=fwd_mask_sparsity,
       max_logit_value=None,
@@ -164,7 +164,7 @@ def _ring_attention_forward(
   (m_final, l_final, o_final, _, _, _), _ = lax.scan(
       body,
       initial_carry,
-      xs=jnp.arange(0, ring_axis_size),
+      xs=jnp.arange(0, ring_axis_size),  # pyrefly: ignore[bad-argument-type]
       length=ring_axis_size,
       unroll=True,
   )  # type: ignore[arg-type]
@@ -193,7 +193,7 @@ def _ring_attention_bwd(
     do: jax.Array,
 ):
   del save_residuals
-  (q, k, v, segment_ids, sinks, out, logsumexp, dkv_mask_info) = res
+  q, k, v, segment_ids, sinks, out, logsumexp, dkv_mask_info, _ = res
   do = do.astype(jnp.float32)
 
   ring_axis_size = lax.axis_size(ring_axis)
@@ -241,6 +241,7 @@ def _ring_attention_bwd(
         out,
         logsumexp,
         local_dkv_mask_info,
+        None,  # prng_key: ring attention does not expose attention dropout.
     )
 
     attn_bwd = functools.partial(
@@ -248,12 +249,12 @@ def _ring_attention_bwd(
         save_residuals=False,
         mask_value=mask_value,
         is_mqa=is_mqa,
-        config=config,
+        config=config,  # pyrefly: ignore[bad-argument-type]
         mask_function=mask_function,
         fwd_mask_sparsity=fwd_mask_sparsity,
         dkv_mask_sparsity=dkv_mask_sparsity,
     )
-    _, _, dq_i, dk_i, dv_i, _, dsinks, _ = attn_bwd(
+    _, _, dq_i, dk_i, dv_i, _, dsinks, _, _ = attn_bwd(
         res=residuals_for_chunk, grads=do
     )
     dv_next = shift(dv_accum + dv_i.astype(dv_accum.dtype))
@@ -274,7 +275,7 @@ def _ring_attention_bwd(
   (dq, dk, dv, _, _, _, dsinks), _ = lax.scan(
       body,
       initial_carry,
-      xs=jnp.arange(ring_axis_size),
+      xs=jnp.arange(ring_axis_size),  # pyrefly: ignore[bad-argument-type]
       length=ring_axis_size,
       unroll=True,
   )
@@ -356,7 +357,7 @@ def _ring_attention_fwd(
       fwd_mask_sparsity=fwd_mask_sparsity,
       ring_axis=ring_axis,
   )
-  residuals = (q, k, v, segment_ids, sinks, out, logsumexp, dkv_mask_info)
+  residuals = (q, k, v, segment_ids, sinks, out, logsumexp, dkv_mask_info, None)
   return out, residuals
 
 
