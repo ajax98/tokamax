@@ -112,7 +112,7 @@ def _calculate_col_chunk_size(col_size: int, num_simd_lanes: int) -> int:
   match generation:
     case 6:
       target_bytes = int(256 * 1024 * 0.95)
-    case 7:
+    case 5 | 7:
       target_bytes = int(512 * 1024 * 0.95)
     case _:
       target_bytes = int(128 * 1024 * 0.95)
@@ -589,7 +589,6 @@ def ragged_gather_reduce_pallas(
       compiler_params=pltpu.CompilerParams(
           use_tc_tiling_on_sc=True,
           disable_bounds_checks=True,
-          needs_layout_passes=False,
       ),
       scratch_types=scratches,
       mesh=vector_mesh,

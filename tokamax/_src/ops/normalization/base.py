@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Normalization op."""
+"""Normalization Op."""
 
 from collections.abc import Callable
 from typing import Any, override
@@ -23,6 +23,7 @@ import jax.numpy as jnp
 from tokamax._src.ops import op
 
 
+type AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray
 type FusedInputArray = fuser.Fusion[[], jax.Array]
 type Residuals = tuple[jax.Array | None, jax.Array]  # mean, rstddev
 
@@ -33,9 +34,9 @@ class Normalization[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
   @override
   def bind(
       self,
-      x: jax.Array | Callable[[], jax.Array],
-      scale: jax.Array | None,
-      offset: jax.Array | None,
+      x: jax.Array | AbstractArray | Callable[[], jax.Array],
+      scale: jax.Array | AbstractArray | None,
+      offset: jax.Array | AbstractArray | None,
       *,
       axis: int = -1,
       epsilon: float = 1e-6,

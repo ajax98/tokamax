@@ -12,271 +12,322 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Base functionality for Sparse Flash Attention."""
 
-import functools
-from typing import Final, NamedTuple
+"""Base operator for Splash Attention."""
+
+import dataclasses
+from typing import Any, Final, NotRequired, TypeAlias, TypeVar, TypedDict, override
 import jax
 import jax.numpy as jnp
+from jaxtyping import Array, Bool, Float  # pylint: disable=g-multiple-import,g-importing-member
 import numpy as np
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask_info as mask_info_lib
+from tokamax._src import jaxtyping
+from tokamax._src.ops import op
+from tokamax._src.ops.experimental.tpu.splash_attention import reference
+from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as mask_lib
 
+_Config = TypeVar("_Config")
 
-MaskInfo = mask_info_lib.MaskInfo
+DEFAULT_MASK_VALUE = reference.DEFAULT_MASK_VALUE
+SegmentIds = reference.SegmentIds
+SplashCustomReturnType = reference.SplashCustomReturnType
+SplashResidualsType = reference.SplashResidualsType
+attention_reference = reference.attention_reference
+attention_reference_vjp = reference.attention_reference_vjp
 
-
-DEFAULT_MASK_VALUE: Final[float] = -0.7 * float(
-    np.finfo(np.dtype("float32")).max
-)
-
-
-class SegmentIds(NamedTuple):
-  """SegmentIds for Q and KV sequences.
-
-  SegmentIds are a mechanism to ensure that there is no cross-attention between
-  segments (fraction of a sequence) that have been concatenated together into a
-  sequence. Each array is a list of ids (integers). Only tokens with the same
-  id are allowed to attend to each other.
-
-  The static mask (e.g. causal) is "and-ed" with the segment id mask to form
-  the actual attention mask. It is important that the latter does not have any
-  all-zero rows (along dimension kv). Otherwise it would result in a invalid
-  softmax (the denominator would be 0).
-  This condition holds for causal self-attention because in this case segment
-  ids form a block diagonal matrix so at least one element in each row is set.
-  It is easy to break this condition with non-self-attention configurations.
-  Attributes:
-    q: segment ids along the Q sequence
-    kv: segment ids along the KV sequence
-  """
-
-  q: jax.Array | jax.sharding.PartitionSpec  # [q_seq_len]
-  kv: jax.Array | jax.sharding.PartitionSpec  # [kv_seq_len]
-
-
-# Return type of SplashAttention function that implements the custom vjp rule.
-type SplashCustomReturnType = jax.Array | tuple[jax.Array, dict[str, jax.Array]]
-type SplashResidualsType = tuple[
-    jax.Array,  # q
-    jax.Array,  # k
-    jax.Array,  # v
-    SegmentIds | None,  # segment_ids
-    jax.Array | None,  # sinks
-    jax.Array,  # out
-    jax.Array,  # logsumexp
-    MaskInfo | None,  # dkv_mask_info
+Residuals: TypeAlias = tuple[
+    Float[Array, "num_q_heads q_seq_len"],
+    Float[Array, "num_q_heads q_seq_len"],
 ]
 
 
-def _attention_reference_impl(
-    q: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
-    mask: jax.Array,
-    segment_ids: SegmentIds | None,
-    sinks: jax.Array | None,
-    mask_value: float,
-    save_residuals: bool,
-    attn_logits_soft_cap: float | None,
-) -> SplashCustomReturnType:
-  logits = jnp.einsum("sd,td->st", q.astype(jnp.float32), k.astype(jnp.float32))
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, slots=True)
+class Mask:
+  """An attention mask dataclass."""
 
-  if segment_ids is not None:
-    mask = jnp.logical_and(
-        mask, segment_ids.q[:, None] == segment_ids.kv[None, :]
+  bool_mask: Bool[jax.Array, "q_seq_len kv_seq_len"] | None = None
+  _: dataclasses.KW_ONLY
+  is_causal: bool = dataclasses.field(default=False, metadata=dict(static=True))
+
+  def as_array(
+      self,
+      q_seq_len: int,
+      kv_seq_len: int,
+  ) -> Bool[Array, "q_seq_len kv_seq_len"]:
+    """Returns the mask as a 2D boolean array."""
+
+    q_idx = jnp.arange(q_seq_len)[:, None]
+    kv_idx = jnp.arange(kv_seq_len)[None, :]
+
+    if self.bool_mask is not None and self.is_causal:
+      return jnp.logical_and(jnp.asarray(self.bool_mask), q_idx >= kv_idx)
+
+    if self.bool_mask is not None:
+      return jnp.asarray(self.bool_mask)
+
+    if self.is_causal:
+      return q_idx >= kv_idx
+
+    return jnp.ones((q_seq_len, kv_seq_len), dtype=jnp.bool_)
+
+  def __bool__(self) -> bool:
+    return self.bool_mask is not None or self.is_causal
+
+
+CAUSAL_MASK: Final[Mask] = Mask(is_causal=True)
+FULL_MASK: Final[Mask] = Mask()
+
+
+def _canonicalize_mask(
+    mask: Bool[Array, "q_seq_len kv_seq_len"] | Mask | mask_lib.Mask | None,
+) -> Mask:
+  """Canonicalizes a mask argument."""
+  if mask is None:
+    return Mask()
+  if isinstance(mask, (jax.Array, np.ndarray)):
+    return Mask(bool_mask=mask)
+  if isinstance(mask, mask_lib.CausalMask):
+    return Mask(is_causal=True)
+  if isinstance(mask, mask_lib.FullMask):
+    return Mask()
+  if isinstance(mask, mask_lib.Mask):
+    return Mask(bool_mask=jnp.asarray(mask[:, :]))
+  if isinstance(mask, Mask):
+    return mask
+  raise TypeError(f"Unsupported mask type: {type(mask)}")
+
+
+@dataclasses.dataclass(frozen=True)
+class SplashAttention[_Config](op.Op[Any, jax.Array, Residuals, _Config, Any]):
+  """Tokamax operator template for Splash Attention."""
+
+  def __post_init__(self):
+    if self.vjp is None:
+      object.__setattr__(
+          self,
+          "vjp",
+          SplashAttentionVjp(),
+      )
+
+  def bind(
+      self,
+      q: Float[Array, "num_q_heads q_seq_len head_dim_qk"],
+      k: Float[Array, "..."],
+      v: Float[Array, "..."],
+      mask: (
+          Bool[Array, "q_seq_len kv_seq_len"] | Mask | mask_lib.Mask | None
+      ) = None,
+      segment_ids: SegmentIds | None = None,
+      sinks: Float[Array, "..."] | None = None,
+      *,
+      is_mqa: bool = False,
+      mask_value: float = DEFAULT_MASK_VALUE,
+      attn_logits_soft_cap: float | None = None,
+      dropout_rate: float = 0.0,
+      return_residuals: bool = False,
+  ) -> op.BoundArguments:
+    """Binds and validates arguments for Splash Attention."""
+
+    if not (0.0 <= dropout_rate < 1.0):
+      raise ValueError(f"dropout_rate must be in [0, 1), got {dropout_rate}.")
+
+    if not is_mqa and k.ndim == 3 and q.ndim == 3:
+      if q.shape[0] % k.shape[0] != 0:
+        raise ValueError(
+            f"num_q_heads ({q.shape[0]}) must be divisible by num_kv_heads"
+            f" ({k.shape[0]})."
+        )
+
+    mask = _canonicalize_mask(mask)
+
+    return super().bind(
+        q,
+        k,
+        v,
+        mask=mask,
+        segment_ids=segment_ids,
+        sinks=sinks,
+        is_mqa=is_mqa,
+        mask_value=mask_value,
+        attn_logits_soft_cap=attn_logits_soft_cap,
+        dropout_rate=dropout_rate,
+        return_residuals=return_residuals,
     )
 
-  if attn_logits_soft_cap is not None:
-    logits = jnp.tanh(logits / attn_logits_soft_cap)
-    logits = logits * attn_logits_soft_cap
+  @override
+  @jaxtyping.jaxtyped
+  def _fwd(
+      self,
+      q: Float[Array, "num_q_heads q_seq_len head_dim_qk"],
+      k: Float[Array, "..."],
+      v: Float[Array, "..."],
+      *,
+      mask: Mask,
+      segment_ids: SegmentIds | None = None,
+      sinks: Float[Array, "..."] | None = None,
+      is_mqa: bool = False,
+      mask_value: float = DEFAULT_MASK_VALUE,
+      attn_logits_soft_cap: float | None = None,
+      dropout_rate: float = 0.0,
+      return_residuals: bool = False,
+      config: _Config,
+  ) -> tuple[jax.Array, Residuals | None]:
+    del config
 
-  if sinks is not None:
-    assert sinks.shape == ()  # should already be vmapped
+    q_seq_len = q.shape[1]
+    kv_seq_len = k.shape[0] if is_mqa and k.ndim == 2 else k.shape[1]
+    mask_array = mask.as_array(q_seq_len, kv_seq_len)
 
-  logits = jnp.where(mask, logits, mask_value)
-  m = logits.max(axis=-1)
-  sinks = None if sinks is None else sinks.astype(logits.dtype)
-  m = m if sinks is None else jnp.maximum(m, sinks)
-  s = jnp.exp(logits - m[..., None])
-  l = s.sum(axis=-1) + (0 if sinks is None else jnp.exp(sinks - m))
-  p = s / l[..., None]
+    if is_mqa and k.ndim == 3:
+      k_in = k[0]
+      v_in = v[0]
+    else:
+      k_in = k
+      v_in = v
 
-  o = jnp.einsum("st,td->sd", p, v.astype(jnp.float32))
-
-  if save_residuals:
-    logsumexp = m + jnp.log(l)
-    return o, {"logsumexp": logsumexp, "max_logits": m}
-  return o
-
-
-def _attention_reference_custom_bwd(
-    do,
-    q,
-    k,
-    v,
-    mask,
-    segment_ids,
-    sinks,
-    o,
-    logsumexp,
-    mask_value: float = DEFAULT_MASK_VALUE,
-    backward_impl: str = "vanilla",
-    attn_logits_soft_cap: float | None = None,
-) -> tuple[jax.Array, jax.Array, jax.Array, None, None, jax.Array | None]:
-  uncapped_logits = jnp.einsum(
-      "qc,kc->qk", q, k, preferred_element_type=jnp.float32
-  )
-
-  if attn_logits_soft_cap is not None:
-    logits = jnp.tanh(uncapped_logits / attn_logits_soft_cap)
-    logits = logits * attn_logits_soft_cap
-  else:
-    logits = uncapped_logits
-
-  if segment_ids is not None:
-    mask = jnp.logical_and(
-        mask, segment_ids.q[:, None] == segment_ids.kv[None, :]
+    out = reference.attention_reference(
+        q=q,
+        k=k_in,
+        v=v_in,
+        mask=mask_array,
+        segment_ids=segment_ids,
+        sinks=sinks,
+        dropout_mask=None,
+        is_mqa=is_mqa,
+        mask_value=mask_value,
+        save_residuals=return_residuals,
+        attn_logits_soft_cap=attn_logits_soft_cap,
+        dropout_rate=dropout_rate,
     )
-  logits = jnp.where(mask, logits, mask_value)
-
-  p = jnp.exp(logits - logsumexp[..., None])
-  do = do.astype(jnp.float32)
-  dv = jnp.einsum("pt,pd->td", p, do).astype(v.dtype)
-  dp = jnp.einsum("pd,td->pt", do, v.astype(jnp.float32))
-
-  # These two ways of computing ds are mathematically equivalent. The first
-  # involves reducing over the head_dim dimension and the second involves
-  # reducing over a sequence dimension. They tend to produce slightly different
-  # numerics.
-  if backward_impl == "flash":
-    di = jnp.sum(o.astype(jnp.float32) * do, axis=-1)[..., None]
-  else:
-    di = jnp.einsum("st,st->s", dp, p)[:, None]
-  ds = (dp - di) * p
-  if attn_logits_soft_cap is not None:
-    normalized = uncapped_logits / attn_logits_soft_cap
-    d = jnp.tanh(normalized)
-    g = ds * (1 - d)
-    ds = g + g * d
-  dk = jnp.einsum("sd,st->td", q.astype(jnp.float32), ds).astype(k.dtype)
-  dq = jnp.einsum("st,td->sd", ds, k.astype(jnp.float32)).astype(q.dtype)
-  dsinks = None
-  if sinks is not None:
-    sinks_exp = -jnp.exp(
-        sinks[..., None, None].astype(jnp.float32)
-        - logsumexp[..., None].astype(jnp.float32)
-    )
-    dsinks = jnp.sum(sinks_exp.astype(o.dtype) * o * do, axis=(-1, -2))
-  return dq, dk, dv, None, None, dsinks
+    if return_residuals:
+      out, stats = out
+      residuals = (stats["max_logits"], stats["logsumexp"])
+    else:
+      residuals = None
+    return out.astype(q.dtype), residuals
 
 
-@functools.partial(
-    jax.jit,
-    static_argnames=[
-        "mask_value",
-        "save_residuals",
-        "attn_logits_soft_cap",
-        "is_mqa",
-    ],
-)
-def attention_reference(
-    q: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
-    mask: jax.Array,
-    segment_ids: SegmentIds | None = None,
-    sinks: jax.Array | None = None,
-    *,
-    is_mqa: bool,
-    mask_value: float = DEFAULT_MASK_VALUE,
-    save_residuals: bool = False,
-    attn_logits_soft_cap: float | None = None,
+class SplashAttentionGrads(TypedDict):
+  q: Float[Array, "num_q_heads q_seq_len head_dim_qk"]
+  k: Float[Array, "..."]
+  v: Float[Array, "..."]
+  sinks: NotRequired[Float[Array, "..."] | None]
+
+
+class SplashAttentionVjp[_Config](
+    op.Op[Any, SplashAttentionGrads, None, _Config, Any]
 ):
-  """A JIT-compiled reference implementation of attention, handles MQA and MHA."""
-  attn_impl = functools.partial(
-      _attention_reference_impl,
-      mask_value=mask_value,
-      save_residuals=save_residuals,
-      attn_logits_soft_cap=attn_logits_soft_cap,
-  )
+  """Splash attention VJP."""
 
-  if is_mqa:
-    func = jax.vmap(attn_impl, in_axes=(0, None, None, None, None, 0))
-  else:
-    # In grouped attention (1 < num_kv_heads && num_kv_heads < num_q_heads).
-    # We interleave the KV heads across the Q heads.
-    # For example: for 8 Q heads and 4 KV heads:
-    # Q head [0, 1] see KV head 0
-    # Q head [2, 3] see KV head 1
-    # Q head [4, 5] see KV head 2
-    # Q head [6, 7] see KV head 3
+  def bind(
+      self,
+      residuals: Residuals,
+      out: Float[Array, "num_q_heads q_seq_len head_dim_v"],
+      dout: Float[Array, "num_q_heads q_seq_len head_dim_v"],
+      q: Float[Array, "num_q_heads q_seq_len head_dim_qk"],
+      k: Float[Array, "..."],
+      v: Float[Array, "..."],
+      mask: (
+          Bool[Array, "q_seq_len kv_seq_len"] | Mask | mask_lib.Mask | None
+      ) = None,
+      segment_ids: SegmentIds | None = None,
+      sinks: Float[Array, "..."] | None = None,
+      *,
+      is_mqa: bool = False,
+      mask_value: float = DEFAULT_MASK_VALUE,
+      attn_logits_soft_cap: float | None = None,
+      dropout_rate: float = 0.0,
+      return_residuals: bool = False,
+  ) -> op.BoundArguments:
+    """Binds and validates arguments for Splash Attention VJP."""
+    if not (0.0 <= dropout_rate < 1.0):
+      raise ValueError(f"dropout_rate must be in [0, 1), got {dropout_rate}.")
 
-    kv_heads, q_heads = k.shape[0], q.shape[0]
-    assert q_heads % kv_heads == 0
+    if not is_mqa and k.ndim == 3 and q.ndim == 3:
+      if q.shape[0] % k.shape[0] != 0:
+        raise ValueError(
+            f"num_q_heads ({q.shape[0]}) must be divisible by num_kv_heads"
+            f" ({k.shape[0]})."
+        )
 
-    if kv_heads < q_heads:
-      # Repeat K and V heads to match the number of Q heads.
-      q_heads_per_kv = q_heads // kv_heads
-      k = jnp.repeat(k, repeats=q_heads_per_kv, axis=0)
-      v = jnp.repeat(v, repeats=q_heads_per_kv, axis=0)
+    mask = _canonicalize_mask(mask)
 
-    func = jax.vmap(attn_impl, in_axes=(0, 0, 0, None, None, 0))
+    return super().bind(
+        residuals,
+        out,
+        dout,
+        q,
+        k,
+        v,
+        mask=mask,
+        segment_ids=segment_ids,
+        sinks=sinks,
+        is_mqa=is_mqa,
+        mask_value=mask_value,
+        attn_logits_soft_cap=attn_logits_soft_cap,
+        dropout_rate=dropout_rate,
+        return_residuals=return_residuals,
+    )
 
-  out = func(q, k, v, mask, segment_ids, sinks)
-  return out
+  @jaxtyping.jaxtyped
+  @override
+  def _fwd(
+      self,
+      residuals: Residuals,
+      out: Float[Array, "num_q_heads q_seq_len head_dim_v"],
+      dout: Float[Array, "num_q_heads q_seq_len head_dim_v"],
+      q: Float[Array, "num_q_heads q_seq_len head_dim_qk"],
+      k: Float[Array, "..."],
+      v: Float[Array, "..."],
+      *,
+      mask: Mask,
+      segment_ids: SegmentIds | None = None,
+      sinks: Float[Array, "..."] | None = None,
+      is_mqa: bool = False,
+      mask_value: float = DEFAULT_MASK_VALUE,
+      attn_logits_soft_cap: float | None = None,
+      dropout_rate: float = 0.0,
+      return_residuals: bool = False,
+      config: _Config,
+  ) -> tuple[SplashAttentionGrads, None]:
+    """Computes attention VJP."""
+    del config
 
+    if return_residuals:
+      raise NotImplementedError("`return_residuals` not supported.")
 
-@functools.partial(
-    jax.jit, static_argnames=["is_mqa", "backward_impl", "attn_logits_soft_cap"]
-)
-def attention_reference_vjp(
-    do,
-    q,
-    k,
-    v,
-    mask,
-    segment_ids,
-    sinks,
-    o,
-    logsumexp,
-    *,
-    is_mqa: bool,
-    backward_impl: str = "vanilla",
-    attn_logits_soft_cap: float | None = None,
-):
-  """Wrapper for backward reference that handles GQA/MQA broadcasting and reduction."""
-  bwd = functools.partial(
-      _attention_reference_custom_bwd,
-      backward_impl=backward_impl,
-      attn_logits_soft_cap=attn_logits_soft_cap,
-  )
+    _, lse = residuals
 
-  num_q_heads = q.shape[0]
-  num_kv_heads = 1 if is_mqa else k.shape[0]
+    seq_len_q = q.shape[1]
+    seq_len_kv = k.shape[0] if is_mqa and k.ndim == 2 else k.shape[1]
+    mask_array = mask.as_array(seq_len_q, seq_len_kv)
 
-  is_grouped = not is_mqa and num_kv_heads < num_q_heads
-  assert num_q_heads % num_kv_heads == 0
-  head_multiplier = num_q_heads // num_kv_heads
-  if is_mqa:
-    bwd = jax.vmap(bwd, in_axes=(0, 0, None, None, None, None, 0, 0, 0))
-  else:
-    bwd = jax.vmap(bwd, in_axes=(0, 0, 0, 0, None, None, 0, 0, 0))
-    # Interleave the KV heads to match the corresponding Q heads.
-    if is_grouped:
-      k = jnp.repeat(k, head_multiplier, axis=0)
-      v = jnp.repeat(v, head_multiplier, axis=0)
+    if is_mqa and k.ndim == 3:
+      k_in = k[0]
+      v_in = v[0]
+    else:
+      k_in = k
+      v_in = v
 
-  dq, dk, dv, _, _, dsinks = bwd(
-      do, q, k, v, mask, segment_ids, sinks, o, logsumexp
-  )
+    dq, dk, dv, dsinks = reference.attention_reference_vjp(
+        do=dout,
+        q=q,
+        k=k_in,
+        v=v_in,
+        mask=mask_array,
+        segment_ids=segment_ids,
+        sinks=sinks,
+        o=out,
+        logsumexp=lse,
+        is_mqa=is_mqa,
+        attn_logits_soft_cap=attn_logits_soft_cap,
+        dropout_rate=dropout_rate,
+    )
 
-  if is_mqa:
-    dk, dv = dk.sum(axis=0), dv.sum(axis=0)
-  elif is_grouped:
-    # Perform the sum reduction across the head_multiplier dimension only.
-    # So that the output still has KV heads.
-    dk = dk.reshape(num_kv_heads, head_multiplier, *dk.shape[1:])
-    dv = dv.reshape(num_kv_heads, head_multiplier, *dv.shape[1:])
-    dk, dv = dk.sum(axis=1), dv.sum(axis=1)
+    if is_mqa and k.ndim == 3:
+      dk = dk.reshape(k.shape)
+      dv = dv.reshape(v.shape)
 
-  return dq, dk, dv, dsinks
+    grads = SplashAttentionGrads(q=dq, k=dk, v=dv, sinks=dsinks)
+    return grads, None
